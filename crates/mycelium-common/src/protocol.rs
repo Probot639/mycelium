@@ -74,3 +74,19 @@ pub struct StatusUpdate {
     pub node_id: String,
     pub status: NodeStatus,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateCampaignRequest {
+    pub name: String,
+    pub fuzzer_name: String,
+    pub fuzzer_command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignInfo {
+    pub name: String,
+    pub fuzzer_name: String,
+    pub fuzzer_command: Vec<String>,
+    pub harness_len: u64,
+    pub created_at: i64,
+}

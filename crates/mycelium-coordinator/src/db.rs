@@ -62,6 +62,14 @@ impl Db {
                 seed_hash TEXT NOT NULL,
                 node_id TEXT NOT NULL,
                 PRIMARY KEY (seed_hash, node_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS campaigns (
+                name TEXT PRIMARY KEY,
+                fuzzer_name TEXT NOT NULL,
+                fuzzer_command TEXT NOT NULL,
+                harness_len INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
             );",
         )?;
         Ok(())
@@ -244,6 +252,52 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    pub fn create_campaign(
+        &self,
+        name: &str,
+        fuzzer_name: &str,
+        fuzzer_command: &[String],
+    ) -> Result<()> {
+        let cmd_json = serde_json::to_string(fuzzer_command)?;
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO campaigns (name, fuzzer_name, fuzzer_command, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            (name, fuzzer_name, &cmd_json, now),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_campaign(&self, name: &str) -> Result<Option<mycelium_common::protocol::CampaignInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, fuzzer_name, fuzzer_command, harness_len, created_at FROM campaigns WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map([name], |row| {
+            let cmd_json: String = row.get(2)?;
+            let harness_len: i64 = row.get(3)?;
+            Ok(mycelium_common::protocol::CampaignInfo {
+                name: row.get(0)?,
+                fuzzer_name: row.get(1)?,
+                fuzzer_command: serde_json::from_str(&cmd_json).unwrap_or_default(),
+                harness_len: harness_len as u64,
+                created_at: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(info)) => Ok(Some(info)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_harness_len(&self, campaign: &str, len: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE campaigns SET harness_len = ?1 WHERE name = ?2",
+            (len as i64, campaign),
+        )?;
+        Ok(())
     }
 }
 

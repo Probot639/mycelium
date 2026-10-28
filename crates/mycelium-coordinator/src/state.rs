@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use mycelium_common::corpus::{CrashEntry, Seed};
 use mycelium_common::node::{NodeInfo, NodeStatus};
-use mycelium_common::protocol::CampaignStatus;
+use mycelium_common::protocol::{CampaignInfo, CampaignStatus};
 
 use crate::db::Db;
 
@@ -17,10 +17,9 @@ pub struct CoordinatorState {
 impl CoordinatorState {
     pub fn new(db_path: &Path, corpus_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(corpus_dir)?;
-        let blobs_dir = corpus_dir.join("blobs");
-        std::fs::create_dir_all(&blobs_dir)?;
-        let crashes_dir = corpus_dir.join("crashes");
-        std::fs::create_dir_all(&crashes_dir)?;
+        std::fs::create_dir_all(corpus_dir.join("blobs"))?;
+        std::fs::create_dir_all(corpus_dir.join("crashes"))?;
+        std::fs::create_dir_all(corpus_dir.join("harnesses"))?;
 
         Ok(Self {
             db: Mutex::new(Db::open(db_path)?),
@@ -32,6 +31,7 @@ impl CoordinatorState {
         std::fs::create_dir_all(corpus_dir)?;
         std::fs::create_dir_all(corpus_dir.join("blobs"))?;
         std::fs::create_dir_all(corpus_dir.join("crashes"))?;
+        std::fs::create_dir_all(corpus_dir.join("harnesses"))?;
         Ok(Self {
             db: Mutex::new(Db::open_in_memory()?),
             corpus_dir: corpus_dir.to_path_buf(),
@@ -112,5 +112,42 @@ impl CoordinatorState {
                 .filter(|n| n.status == NodeStatus::Online)
                 .count() as u64,
         })
+    }
+
+    pub fn create_campaign(
+        &self,
+        name: &str,
+        fuzzer_name: &str,
+        fuzzer_command: &[String],
+    ) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.create_campaign(name, fuzzer_name, fuzzer_command)
+    }
+
+    pub fn get_campaign(&self, name: &str) -> Result<Option<CampaignInfo>> {
+        let db = self.db.lock().unwrap();
+        db.get_campaign(name)
+    }
+
+    pub fn store_harness(&self, campaign: &str, data: &[u8]) -> Result<()> {
+        let path = self.corpus_dir.join("harnesses").join(campaign);
+        std::fs::write(&path, data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let db = self.db.lock().unwrap();
+        db.set_harness_len(campaign, data.len() as u64)?;
+        Ok(())
+    }
+
+    pub fn get_harness(&self, campaign: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.corpus_dir.join("harnesses").join(campaign);
+        if path.exists() {
+            Ok(Some(std::fs::read(&path)?))
+        } else {
+            Ok(None)
+        }
     }
 }

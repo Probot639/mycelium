@@ -110,6 +110,98 @@ async fn deregister_drains() {
 }
 
 #[tokio::test]
+async fn campaign_create_and_harness_roundtrip() {
+    let (url, _tmp) = start_server().await;
+
+    // create campaign
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/campaign"))
+        .json(&mycelium_common::protocol::CreateCampaignRequest {
+            name: "fuzz-libpng".into(),
+            fuzzer_name: "aflpp".into(),
+            fuzzer_command: vec![
+                "afl-fuzz".into(),
+                "-i".into(),
+                "{corpus}".into(),
+                "-o".into(),
+                "{output}".into(),
+                "--".into(),
+                "{harness}".into(),
+            ],
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // check it exists
+    let info: mycelium_common::protocol::CampaignInfo = client
+        .get(format!("{url}/campaign/fuzz-libpng"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info.name, "fuzz-libpng");
+    assert_eq!(info.harness_len, 0);
+
+    // upload harness
+    let fake_binary = vec![0xEFu8; 1024];
+    let resp = client
+        .put(format!("{url}/campaign/fuzz-libpng/harness"))
+        .body(fake_binary.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // download it back
+    let downloaded = reqwest::get(format!("{url}/campaign/fuzz-libpng/harness"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.len(), 1024);
+    assert_eq!(&downloaded[..], &fake_binary[..]);
+
+    // campaign should now show harness_len
+    let info: mycelium_common::protocol::CampaignInfo = client
+        .get(format!("{url}/campaign/fuzz-libpng"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info.harness_len, 1024);
+}
+
+#[tokio::test]
+async fn campaign_not_found() {
+    let (url, _tmp) = start_server().await;
+    let resp = reqwest::get(format!("{url}/campaign/nonexistent"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn harness_upload_requires_campaign() {
+    let (url, _tmp) = start_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!("{url}/campaign/nonexistent/harness"))
+        .body(vec![0u8; 64])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
 async fn source_node_does_not_receive_own_seeds() {
     let (url, _tmp) = start_server().await;
 

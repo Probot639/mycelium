@@ -164,4 +164,81 @@ impl SyncClient {
         }
         Ok(())
     }
+
+    pub async fn create_campaign(
+        coordinator_url: &str,
+        name: &str,
+        fuzzer_name: &str,
+        fuzzer_command: &[String],
+    ) -> Result<()> {
+        let base = if coordinator_url.starts_with("http") {
+            coordinator_url.to_string()
+        } else {
+            format!("http://{coordinator_url}")
+        };
+        reqwest::Client::new()
+            .post(format!("{base}/campaign"))
+            .json(&mycelium_common::protocol::CreateCampaignRequest {
+                name: name.into(),
+                fuzzer_name: fuzzer_name.into(),
+                fuzzer_command: fuzzer_command.to_vec(),
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn upload_harness(
+        coordinator_url: &str,
+        campaign: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let base = if coordinator_url.starts_with("http") {
+            coordinator_url.to_string()
+        } else {
+            format!("http://{coordinator_url}")
+        };
+        reqwest::Client::new()
+            .put(format!("{base}/campaign/{campaign}/harness"))
+            .body(data)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn download_harness(
+        coordinator_url: &str,
+        campaign: &str,
+    ) -> Result<Vec<u8>> {
+        let base = if coordinator_url.starts_with("http") {
+            coordinator_url.to_string()
+        } else {
+            format!("http://{coordinator_url}")
+        };
+        let bytes = reqwest::get(format!("{base}/campaign/{campaign}/harness"))
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
+    }
+
+    pub async fn get_campaign_info(
+        coordinator_url: &str,
+        campaign: &str,
+    ) -> Result<mycelium_common::protocol::CampaignInfo> {
+        let base = if coordinator_url.starts_with("http") {
+            coordinator_url.to_string()
+        } else {
+            format!("http://{coordinator_url}")
+        };
+        let info = reqwest::get(format!("{base}/campaign/{campaign}"))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(info)
+    }
 }

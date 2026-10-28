@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -159,6 +160,84 @@ pub async fn deregister(
         Err(e) => {
             tracing::error!(error = %e, "deregister failed");
             StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+pub async fn create_campaign(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCampaignRequest>,
+) -> impl IntoResponse {
+    if req.name.is_empty() || req.fuzzer_command.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match state.create_campaign(&req.name, &req.fuzzer_name, &req.fuzzer_command) {
+        Ok(()) => {
+            tracing::info!(campaign = %req.name, "campaign created");
+            StatusCode::CREATED.into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "campaign create failed");
+            StatusCode::CONFLICT.into_response()
+        }
+    }
+}
+
+pub async fn get_campaign(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.get_campaign(&name) {
+        Ok(Some(info)) => (StatusCode::OK, Json(info)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "campaign lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn upload_harness(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> StatusCode {
+    if body.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    // campaign must exist before you can upload a harness for it
+    match state.get_campaign(&name) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    }
+    match state.store_harness(&name, &body) {
+        Ok(()) => {
+            tracing::info!(campaign = %name, bytes = body.len(), "harness uploaded");
+            StatusCode::OK
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "harness store failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+pub async fn download_harness(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.get_harness(&name) {
+        Ok(Some(data)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            data,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "harness read failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
