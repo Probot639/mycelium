@@ -1,0 +1,20 @@
+# PoC - untested
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mycelium-node-config
+data:
+  node.toml: |
+    [node]
+    coordinator = "mycelium-coordinator:7100"
+
+    [fuzzer]
+    name = "aflpp"
+    command = ["afl-fuzz", "-i", "/work/corpus", "-o", "/work/output", "--", "/work/target"]
+    corpus_dir = "/work/output/default/queue"
+    crash_dir = "/work/output/default/crashes"
+    stats_file = "/work/output/default/fuzzer_stats"
+
+    [circle]
+    sync_interval = "30s"
+    inject_dir = "/work/corpus"

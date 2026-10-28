@@ -1,0 +1,21 @@
+[package]
+name = "mycelium-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mycelium"
+path = "src/main.rs"
+
+[dependencies]
+mycelium-common = { workspace = true }
+mycelium-coordinator = { workspace = true }
+mycelium-node = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

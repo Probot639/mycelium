@@ -1,0 +1,47 @@
+# PoC - untested, fill in when nodes are ready
+#
+# One Job per fuzzer config. Scale with --parallelism to spread across nodes.
+# Each pod gets its own node ID on register so they don't collide.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fuzzer-aflpp
+  labels:
+    app: mycelium
+    component: fuzzer
+spec:
+  parallelism: 3  # one pod per node you want fuzzing
+  completions: null  # run until killed
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app: mycelium
+        component: fuzzer
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: fuzzer
+          image: mycelium:latest  # needs AFL++ baked in too
+          command: ["mycelium", "join", "--coordinator", "mycelium-coordinator:7100", "--config", "/etc/mycelium/node.toml"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mycelium
+            - name: workdir
+              mountPath: /work
+          resources:
+            # fuzzing is CPU-bound, don't set a cpu limit or k8s will
+            # throttle mid-run which tanks execs/sec. request what you
+            # need and let it burst.
+            requests:
+              cpu: "2"
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: config
+          configMap:
+            name: mycelium-node-config
+        - name: workdir
+          emptyDir:
+            sizeLimit: 5Gi

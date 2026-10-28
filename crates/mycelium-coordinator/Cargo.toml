@@ -1,0 +1,22 @@
+[package]
+name = "mycelium-coordinator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mycelium-common = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+mycelium-node = { workspace = true }
+reqwest = { workspace = true }
+tempfile = "3"
