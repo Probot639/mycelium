@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mycelium</title>
+<style>
+  :root {
+    --bg: #0e0d0b;
+    --panel: #17150f;
+    --line: #2a2620;
+    --fg: #e8dfce;
+    --dim: #8a8172;
+    --amber: #e0962c;
+    --gold: #d8b45a;
+    --green: #8fb84a;
+    --red: #cc5a3a;
+    --grey: #5a5448;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 "JetBrains Mono", "DejaVu Sans Mono", ui-monospace, monospace;
+    padding: 28px 32px 48px;
+  }
+  h1 { font-size: 18px; margin: 0; color: var(--amber); letter-spacing: 1px; }
+  h1 .camp { color: var(--fg); }
+  .sub { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  .totals { display: flex; gap: 14px; flex-wrap: wrap; margin: 22px 0 26px; }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 12px 18px;
+    min-width: 120px;
+  }
+  .stat .n { font-size: 24px; color: var(--gold); }
+  .stat .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+  .stat.crash .n { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: normal; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  td.id { color: var(--gold); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
+  .online { background: var(--green); }
+  .unreachable { background: var(--amber); }
+  .offline { background: var(--grey); }
+  .suspended { background: var(--red); }
+  .empty { color: var(--dim); padding: 40px 0; text-align: center; }
+  .pri { color: var(--dim); }
+  footer {
+    margin-top: 34px;
+    border-top: 1px solid var(--line);
+    padding-top: 16px;
+    color: var(--dim);
+    font-size: 12px;
+    max-width: 680px;
+  }
+  footer code { color: var(--gold); }
+  .stale { color: var(--red); }
+</style>
+</head>
+<body>
+  <h1>mycelium <span class="camp" id="camp">...</span></h1>
+  <div class="sub" id="sub">connecting to coordinator</div>
+
+  <div class="totals" id="totals"></div>
+
+  <table>
+    <thead>
+      <tr><th>node</th><th>host</th><th>fuzzer</th><th>priority</th><th>status</th><th>last sync</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" hidden>waiting for nodes to join</div>
+
+  <footer>
+    This page is one client of the coordinator's HTTP API, nothing more. It polls
+    <code>GET /scry</code> and draws what comes back. Any other frontend can poll the
+    same endpoint and get the same JSON, so point your own dashboard at this host and
+    read <code>/scry</code> directly.
+  </footer>
+
+<script>
+// The dashboard reads the coordinator the same way every node's probe does: one
+// GET /scry that returns { nodes, campaign } as JSON. Keeping the UI on the public
+// API (rather than a private side channel) is what lets a second frontend show the
+// same campaign without any coordinator change.
+const POLL_MS = 3000;
+
+function hhmmss(unixSecs) {
+  const d = new Date(unixSecs * 1000);
+  const p = n => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function stat(k, n, cls) {
+  return `<div class="stat ${cls||""}"><div class="n">${n}</div><div class="k">${k}</div></div>`;
+}
+
+async function scry() {
+  let data;
+  try {
+    const r = await fetch("/scry", { cache: "no-store" });
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("sub").innerHTML = '<span class="stale">coordinator unreachable, retrying</span>';
+    return;
+  }
+
+  const c = data.campaign || {};
+  const nodes = data.nodes || [];
+  const named = c.name && c.name !== "none";
+
+  document.getElementById("camp").textContent = named ? c.name : "";
+  document.getElementById("sub").textContent =
+    named ? `${c.nodes_online} online, syncing` : "no campaign yet";
+
+  document.getElementById("totals").innerHTML =
+    stat("corpus", c.total_corpus ?? 0) +
+    stat("crashes", c.total_crashes ?? 0, "crash") +
+    stat("execs/sec", c.total_execs_per_sec ?? 0) +
+    stat("nodes", c.nodes_online ?? 0);
+
+  const rows = document.getElementById("rows");
+  const empty = document.getElementById("empty");
+  if (nodes.length === 0) {
+    rows.innerHTML = "";
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  rows.innerHTML = nodes.map(n => `
+    <tr>
+      <td class="id">${n.id}</td>
+      <td>${n.hostname}</td>
+      <td>${n.fuzzer}</td>
+      <td class="pri">${n.priority}</td>
+      <td><span class="dot ${n.status}"></span>${n.status}</td>
+      <td>${hhmmss(n.last_sync)}</td>
+    </tr>`).join("");
+}
+
+scry();
+setInterval(scry, POLL_MS);
+</script>
+</body>
+</html>

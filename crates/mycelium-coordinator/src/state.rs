@@ -98,15 +98,11 @@ impl CoordinatorState {
     pub fn campaign_status(&self, campaign: &str) -> Result<CampaignStatus> {
         let db = self.db.lock().unwrap();
         let nodes = db.list_nodes(Some(campaign))?;
-        // TODO: execs_per_sec lives in the nodes table but NodeInfo doesn't
-        // carry it yet, so this is always zero. fix when we add the stats column
-        // to the select in list_nodes
-        let total_execs_per_sec = 0u64;
         Ok(CampaignStatus {
             name: campaign.to_string(),
             total_corpus: db.count_seeds(campaign)?,
             total_crashes: db.count_crashes(campaign)?,
-            total_execs_per_sec,
+            total_execs_per_sec: db.sum_execs_per_sec(campaign)?,
             nodes_online: nodes
                 .iter()
                 .filter(|n| n.status == NodeStatus::Online)

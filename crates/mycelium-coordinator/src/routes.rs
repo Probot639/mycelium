@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::Json;
 
 use mycelium_common::node::{NodeInfo, NodeStatus};
@@ -131,6 +131,16 @@ pub async fn heartbeat(
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
     StatusCode::OK
+}
+
+// Built-in dashboard. It is deliberately a thin client of /scry so the API, not
+// this page, is the real surface. Everything a frontend needs is one GET:
+//   GET /scry -> { nodes: [...], campaign: {...} }   (see protocol.rs)
+// TODO: when a second frontend shows up, move the read side behind a versioned
+// /api/v1/scry and add CORS so it can live on another origin. An SSE or websocket
+// push would beat the 3s poll, but poll is fine for a tailnet this size.
+pub async fn dashboard() -> Html<&'static str> {
+    Html(include_str!("ui/dashboard.html"))
 }
 
 pub async fn scry(State(state): State<AppState>) -> Json<ScryResponse> {

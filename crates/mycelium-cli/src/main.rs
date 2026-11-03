@@ -323,21 +323,35 @@ async fn run_fuzzer_loop(
     }
     tracing::info!(count = initial_seeds.len(), "pulled initial corpus");
 
-    std::fs::create_dir_all(corpus_dir)?;
-    std::fs::create_dir_all(crash_dir)?;
-
-    let watcher = mycelium_node::watcher::DirWatcher::new();
-    for seed in &initial_seeds {
-        watcher.mark_seen(&seed.hash);
-    }
-    let mut rx = watcher.watch(corpus_dir, crash_dir)?;
-
+    // Start the fuzzer before setting up the watches. AFL++ creates, and on a
+    // fresh run deletes and recreates, its own output dirs during startup. If
+    // we watch those dirs first, inotify is left holding inodes AFL has already
+    // replaced, and no seed or crash ever syncs. So spawn, wait for the queue
+    // and crash dirs to appear, then watch the dirs the fuzzer settled on.
     let mut cmd_iter = fuzzer_command.iter();
     let program = cmd_iter.next().expect("fuzzer command is empty");
     let mut child = tokio::process::Command::new(program)
         .args(cmd_iter)
         .spawn()?;
     tracing::info!(%program, "fuzzer started");
+
+    for _ in 0..100 {
+        if corpus_dir.exists() && crash_dir.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !corpus_dir.exists() || !crash_dir.exists() {
+        tracing::warn!("fuzzer output dirs not present yet, creating and watching anyway");
+        std::fs::create_dir_all(corpus_dir)?;
+        std::fs::create_dir_all(crash_dir)?;
+    }
+
+    let watcher = mycelium_node::watcher::DirWatcher::new();
+    for seed in &initial_seeds {
+        watcher.mark_seen(&seed.hash);
+    }
+    let mut rx = watcher.watch(corpus_dir, crash_dir)?;
 
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(sync_interval_secs));
 

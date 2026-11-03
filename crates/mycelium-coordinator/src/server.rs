@@ -23,6 +23,8 @@ pub fn build_router(state: Arc<CoordinatorState>) -> Router {
     use axum::extract::DefaultBodyLimit;
 
     Router::new()
+        .route("/", get(routes::dashboard))
+        .route("/ui", get(routes::dashboard))
         .route("/register", post(routes::register))
         .route("/seed/push", post(routes::push_seed))
         .route("/seed/pull", post(routes::pull_seeds))

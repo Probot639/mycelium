@@ -254,6 +254,17 @@ impl Db {
         Ok(count)
     }
 
+    // Live throughput across the campaign's online nodes. The per-node value is
+    // written by the heartbeat; summing it here is what the dashboard shows.
+    pub fn sum_execs_per_sec(&self, campaign: &str) -> Result<u64> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(execs_per_sec), 0) FROM nodes WHERE campaign = ?1 AND status = 'online'",
+            [campaign],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
     pub fn create_campaign(
         &self,
         name: &str,
