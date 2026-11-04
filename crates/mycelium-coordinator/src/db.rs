@@ -37,25 +37,28 @@ impl Db {
                 last_sync INTEGER NOT NULL,
                 execs_per_sec INTEGER NOT NULL DEFAULT 0,
                 corpus_size INTEGER NOT NULL DEFAULT 0,
-                crashes_found INTEGER NOT NULL DEFAULT 0
+                crashes_found INTEGER NOT NULL DEFAULT 0,
+                time_limited INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS seeds (
-                hash TEXT PRIMARY KEY,
+                hash TEXT NOT NULL,
                 data BLOB NOT NULL,
                 source_node TEXT NOT NULL,
                 campaign TEXT NOT NULL,
-                found_at INTEGER NOT NULL
+                found_at INTEGER NOT NULL,
+                PRIMARY KEY (hash, campaign)
             );
 
             CREATE TABLE IF NOT EXISTS crashes (
                 stack_hash TEXT NOT NULL,
-                input_hash TEXT PRIMARY KEY,
+                input_hash TEXT NOT NULL,
                 data BLOB NOT NULL,
                 sanitizer_output TEXT NOT NULL,
                 source_node TEXT NOT NULL,
                 campaign TEXT NOT NULL,
-                found_at INTEGER NOT NULL
+                found_at INTEGER NOT NULL,
+                PRIMARY KEY (input_hash, campaign)
             );
 
             CREATE TABLE IF NOT EXISTS seed_distribution (
@@ -72,14 +75,32 @@ impl Db {
                 created_at INTEGER NOT NULL
             );",
         )?;
+        // Add columns introduced after the first schema. A DB created by an
+        // older coordinator will not have them, and ADD COLUMN errors if the
+        // column already exists, so ignore that one case.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE nodes ADD COLUMN time_limited INTEGER NOT NULL DEFAULT 0", []);
         Ok(())
     }
 
     pub fn register_node(&self, info: &NodeInfo) -> Result<()> {
-        // serde_json wraps enum values in quotes ("shared"), trim them for sqlite
+        // serde_json wraps enum values in quotes ("shared"), trim them for sqlite.
+        // On re-register (a restart reusing a stable id) update the descriptive
+        // columns but leave execs_per_sec/corpus_size/crashes_found alone, so a
+        // restart does not zero out the node's accumulated stats. A plain
+        // INSERT OR REPLACE would delete the row and reset those to their default.
         self.conn.execute(
-            "INSERT OR REPLACE INTO nodes (id, hostname, campaign, fuzzer, priority, status, last_sync)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO nodes (id, hostname, campaign, fuzzer, priority, status, last_sync, time_limited)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                hostname = excluded.hostname,
+                campaign = excluded.campaign,
+                fuzzer = excluded.fuzzer,
+                priority = excluded.priority,
+                status = excluded.status,
+                last_sync = excluded.last_sync,
+                time_limited = excluded.time_limited",
             (
                 &info.id,
                 &info.hostname,
@@ -88,6 +109,7 @@ impl Db {
                 serde_json::to_string(&info.priority)?.trim_matches('"'),
                 serde_json::to_string(&info.status)?.trim_matches('"'),
                 info.last_sync.timestamp(),
+                info.time_limited as i64,
             ),
         )?;
         Ok(())
@@ -99,6 +121,18 @@ impl Db {
         self.conn
             .execute("DELETE FROM seed_distribution WHERE node_id = ?1", [node_id])?;
         Ok(())
+    }
+
+    // Mark online nodes whose last heartbeat is older than the timeout as
+    // unreachable, so they stop counting toward nodes_online and the execs/sec
+    // total. Returns how many were reaped.
+    pub fn mark_stale_offline(&self, timeout_secs: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - timeout_secs;
+        let n = self.conn.execute(
+            "UPDATE nodes SET status = 'unreachable' WHERE status = 'online' AND last_sync < ?1",
+            [cutoff],
+        )?;
+        Ok(n)
     }
 
     pub fn update_node_status(&self, node_id: &str, status: NodeStatus) -> Result<()> {
@@ -118,9 +152,17 @@ impl Db {
         crashes_found: u64,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
+        // SQLite integers are signed, and rusqlite refuses a u64 past i64::MAX.
+        // Clamp so a bogus or overflowing node value cannot 500 the heartbeat.
+        let clamp = |v: u64| v.min(i64::MAX as u64) as i64;
+        // A suspended (drained) node that is still alive keeps heartbeating; do
+        // not flip it back to online, or a hand-drain never sticks while the
+        // process runs. Any other status advances to online on a heartbeat.
         self.conn.execute(
-            "UPDATE nodes SET last_sync = ?1, execs_per_sec = ?2, corpus_size = ?3, crashes_found = ?4, status = 'online' WHERE id = ?5",
-            (now, execs_per_sec, corpus_size, crashes_found, node_id),
+            "UPDATE nodes SET last_sync = ?1, execs_per_sec = ?2, corpus_size = ?3, crashes_found = ?4,
+                status = CASE WHEN status = 'suspended' THEN 'suspended' ELSE 'online' END
+             WHERE id = ?5",
+            (now, clamp(execs_per_sec), clamp(corpus_size), clamp(crashes_found), node_id),
         )?;
         Ok(())
     }
@@ -132,7 +174,7 @@ impl Db {
         if let Some(campaign) = campaign {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, hostname, campaign, fuzzer, priority, status, last_sync FROM nodes WHERE campaign = ?1")?;
+                .prepare("SELECT id, hostname, campaign, fuzzer, priority, status, last_sync, time_limited FROM nodes WHERE campaign = ?1")?;
             let rows = stmt.query_map([campaign], |row| {
                 Ok(Self::node_from_row(row))
             })?;
@@ -142,7 +184,7 @@ impl Db {
         } else {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, hostname, campaign, fuzzer, priority, status, last_sync FROM nodes")?;
+                .prepare("SELECT id, hostname, campaign, fuzzer, priority, status, last_sync, time_limited FROM nodes")?;
             let rows = stmt.query_map([], |row| {
                 Ok(Self::node_from_row(row))
             })?;
@@ -157,6 +199,7 @@ impl Db {
         let priority_str: String = row.get(4)?;
         let status_str: String = row.get(5)?;
         let ts: i64 = row.get(6)?;
+        let time_limited: i64 = row.get(7)?;
         Ok(NodeInfo {
             id: row.get(0)?,
             hostname: row.get(1)?,
@@ -166,6 +209,7 @@ impl Db {
                 .unwrap_or(Priority::Shared),
             status: serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(NodeStatus::Offline),
+            time_limited: time_limited != 0,
             last_sync: chrono::DateTime::from_timestamp(ts, 0)
                 .unwrap_or_default(),
         })
@@ -186,12 +230,46 @@ impl Db {
         Ok(result > 0)
     }
 
+    // Remove a just-stored row when its on-disk artifact failed to write, so the
+    // row and the file stay consistent and a retry re-does both (otherwise the
+    // committed row makes the retry short-circuit on is_new=false, leaving a
+    // crash/seed with no reproducer on disk).
+    pub fn delete_seed(&self, hash: &str, campaign: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM seeds WHERE hash = ?1 AND campaign = ?2",
+            [hash, campaign],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_crash(&self, input_hash: &str, campaign: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM crashes WHERE input_hash = ?1 AND campaign = ?2",
+            [input_hash, campaign],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_seed_sent(&self, seed_hash: &str, node_id: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO seed_distribution (seed_hash, node_id) VALUES (?1, ?2)",
             [seed_hash, node_id],
         )?;
         Ok(())
+    }
+
+    // The campaign a node registered for, by primary key. Used to bind a pull to
+    // the node's own campaign so it cannot read another campaign's corpus.
+    pub fn node_campaign(&self, node_id: &str) -> Result<Option<String>> {
+        match self.conn.query_row(
+            "SELECT campaign FROM nodes WHERE id = ?1",
+            [node_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn get_unseen_seeds(&self, node_id: &str, campaign: &str) -> Result<Vec<Seed>> {
@@ -248,6 +326,17 @@ impl Db {
     pub fn count_crashes(&self, campaign: &str) -> Result<u64> {
         let count: u64 = self.conn.query_row(
             "SELECT COUNT(*) FROM crashes WHERE campaign = ?1",
+            [campaign],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    // Distinct bugs, by stack hash. With real traces this is far below the raw
+    // crash count, which is the whole point of dedup by stack.
+    pub fn count_unique_bugs(&self, campaign: &str) -> Result<u64> {
+        let count: u64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT stack_hash) FROM crashes WHERE campaign = ?1",
             [campaign],
             |row| row.get(0),
         )?;
@@ -328,6 +417,7 @@ mod tests {
             fuzzer: "aflpp".into(),
             priority: Priority::Dedicated,
             status: NodeStatus::Online,
+            time_limited: false,
             last_sync: chrono::Utc::now(),
         }
     }
@@ -339,6 +429,59 @@ mod tests {
         db.register_node(&test_node("node-2")).unwrap();
         let nodes = db.list_nodes(Some("test-campaign")).unwrap();
         assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn reaper_marks_stale_offline() {
+        let db = test_db();
+        db.register_node(&test_node("n1")).unwrap();
+        // a fresh node is not stale under a normal timeout
+        assert_eq!(db.mark_stale_offline(60).unwrap(), 0);
+        // a cutoff in the future reaps every online node
+        assert_eq!(db.mark_stale_offline(-1_000_000).unwrap(), 1);
+        let nodes = db.list_nodes(None).unwrap();
+        assert_eq!(nodes[0].status, NodeStatus::Unreachable);
+        // already reaped, so a second pass does nothing
+        assert_eq!(db.mark_stale_offline(-1_000_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn reregister_preserves_stats() {
+        let db = test_db();
+        db.register_node(&test_node("worker-7")).unwrap();
+        db.update_heartbeat("worker-7", 90_000, 5000, 42).unwrap();
+        // a restart re-registers with the same id; stats must survive
+        db.register_node(&test_node("worker-7")).unwrap();
+        let n = db.sum_execs_per_sec("test-campaign").unwrap();
+        assert_eq!(n, 90_000, "execs/sec reset on re-register");
+    }
+
+    #[test]
+    fn heartbeat_does_not_resurrect_suspended() {
+        let db = test_db();
+        db.register_node(&test_node("drained")).unwrap();
+        db.update_node_status("drained", NodeStatus::Suspended).unwrap();
+        // a still-running drained node keeps heartbeating; it must stay suspended
+        db.update_heartbeat("drained", 1000, 10, 0).unwrap();
+        let nodes = db.list_nodes(None).unwrap();
+        assert_eq!(nodes[0].status, NodeStatus::Suspended);
+    }
+
+    #[test]
+    fn same_seed_hash_distinct_campaigns() {
+        let db = test_db();
+        let mk = |campaign: &str| Seed {
+            hash: "deadbeef".into(),
+            data: b"same bytes".to_vec(),
+            source_node: "n".into(),
+            campaign: campaign.into(),
+            found_at: chrono::Utc::now(),
+        };
+        // identical bytes in two campaigns must both store, not collide
+        assert!(db.store_seed(&mk("camp-a")).unwrap());
+        assert!(db.store_seed(&mk("camp-b")).unwrap());
+        assert_eq!(db.count_seeds("camp-a").unwrap(), 1);
+        assert_eq!(db.count_seeds("camp-b").unwrap(), 1);
     }
 
     #[test]

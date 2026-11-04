@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mycelium.fullname" . }}-coordinator
+  labels:
+    {{- include "mycelium.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: {{ .Values.coordinator.replicas }}
+  # One SQLite file behind a RWO volume means a single writer. Recreate avoids
+  # two coordinator pods fighting over the same PVC during a rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mycelium.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: coordinator
+  template:
+    metadata:
+      labels:
+        {{- include "mycelium.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: coordinator
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: coordinator
+          image: {{ include "mycelium.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - mycelium
+            - spawn
+            - "--listen"
+            - "0.0.0.0:{{ .Values.coordinator.service.port }}"
+            - "--corpus"
+            - /data/corpus
+            - "--db"
+            - /data/mycelium.db
+          ports:
+            - name: http
+              containerPort: {{ .Values.coordinator.service.port }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "mycelium.fullname" . }}-coordinator-data
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

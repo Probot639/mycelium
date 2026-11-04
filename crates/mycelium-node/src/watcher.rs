@@ -8,14 +8,23 @@ use tokio::sync::mpsc;
 
 use mycelium_common::corpus::hash_bytes;
 
+use crate::profile::{FileRole, FuzzerProfile};
+
 #[derive(Debug)]
 pub enum WatchEvent {
     NewSeed { path: PathBuf, hash: String, data: Vec<u8> },
     NewCrash { path: PathBuf, data: Vec<u8> },
 }
 
+#[derive(Clone)]
 pub struct DirWatcher {
     seen_hashes: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl Default for DirWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirWatcher {
@@ -29,18 +38,41 @@ impl DirWatcher {
         &self,
         corpus_dir: &Path,
         crash_dir: &Path,
-    ) -> Result<mpsc::Receiver<WatchEvent>> {
-        let (tx, rx) = mpsc::channel(256);
+        profile: &FuzzerProfile,
+    ) -> Result<(notify::RecommendedWatcher, mpsc::UnboundedReceiver<WatchEvent>)> {
+        // Unbounded on purpose. A bounded channel dropped the overflow during the
+        // startup scan of a large corpus, and its blocking_send stalled notify's
+        // callback thread when a fast fuzzer outran the HTTP push. Unbounded never
+        // drops and never blocks the watcher; the push loop drains it. The loop
+        // keeps the drain moving (short HTTP timeouts) so it does not grow without
+        // bound while a coordinator is slow.
+        let (tx, rx) = mpsc::unbounded_channel();
         let corpus = corpus_dir.to_path_buf();
         let crash = crash_dir.to_path_buf();
         let seen = self.seen_hashes.clone();
 
-        // Scan existing files first
-        Self::scan_existing(&corpus, &crash, &seen, &tx)?;
+        // Scan the existing corpus on a dedicated thread: it does blocking
+        // std::fs reads of every file, and watch() is called from inside the
+        // async sync loop, so running it inline would stall the tokio worker (and
+        // the heartbeat/pull timers on it) until the whole corpus was read.
+        {
+            let tx = tx.clone();
+            let seen = seen.clone();
+            let profile = profile.clone();
+            let corpus = corpus.clone();
+            let crash = crash.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = Self::scan_existing(&corpus, &crash, &profile, &seen, &tx) {
+                    tracing::warn!(error = %e, "initial corpus scan failed");
+                }
+            });
+        }
 
         let tx_clone = tx.clone();
         let seen_clone = seen.clone();
         let corpus_clone = corpus.clone();
+        let crash_clone = crash.clone();
+        let profile = profile.clone();
 
         // notify fires both Create and Modify for AFL++'s rename-into-queue pattern,
         // the seen_hashes set deduplicates so we just handle both
@@ -50,6 +82,10 @@ impl DirWatcher {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in event.paths {
                         if !path.is_file() {
+                            continue;
+                        }
+                        let role = profile.classify(&path, &corpus_clone, &crash_clone);
+                        if role == FileRole::Ignore {
                             continue;
                         }
                         let Ok(data) = std::fs::read(&path) else {
@@ -66,19 +102,14 @@ impl DirWatcher {
                             }
                             seen.insert(hash.clone());
                         }
-                        let is_crash = path.starts_with(&crash);
-                        let is_corpus = path.starts_with(&corpus_clone);
-                        if is_crash {
-                            let _ = tx_clone.blocking_send(WatchEvent::NewCrash {
-                                path,
-                                data,
-                            });
-                        } else if is_corpus {
-                            let _ = tx_clone.blocking_send(WatchEvent::NewSeed {
-                                path,
-                                hash,
-                                data,
-                            });
+                        match role {
+                            FileRole::Crash => {
+                                let _ = tx_clone.send(WatchEvent::NewCrash { path, data });
+                            }
+                            FileRole::Seed => {
+                                let _ = tx_clone.send(WatchEvent::NewSeed { path, hash, data });
+                            }
+                            FileRole::Ignore => {}
                         }
                     }
                 }
@@ -86,34 +117,61 @@ impl DirWatcher {
             }
         })?;
 
-        if corpus_dir.exists() {
+        // Watch the corpus recursively. Watch the crash dir only when it is not
+        // already covered: equal to, or nested under, a corpus dir we watched.
+        // (A distributed honggfuzz node has crash_dir = output/crashes under
+        // corpus_dir = output, so the recursive corpus watch already sees it.)
+        let corpus_watched = corpus_dir.exists();
+        if corpus_watched {
             watcher.watch(corpus_dir, RecursiveMode::Recursive)?;
         }
-        if crash_dir.exists() {
+        if crash_dir.exists() && !(corpus_watched && crash_dir.starts_with(corpus_dir)) {
             watcher.watch(crash_dir, RecursiveMode::Recursive)?;
         }
 
-        // leaked on purpose, circle process owns it until killed
-        std::mem::forget(watcher);
-
-        Ok(rx)
+        // Hand the watcher back so the caller owns it for the run's lifetime.
+        // Dropping it unwatches and frees the inotify FDs and callback thread,
+        // which matters in round mode where watch() is called once per round:
+        // leaking it (the old std::mem::forget) piled up a live watcher per round
+        // until the node hit its FD limit.
+        Ok((watcher, rx))
     }
 
     fn scan_existing(
         corpus_dir: &Path,
         crash_dir: &Path,
+        profile: &FuzzerProfile,
         seen: &Arc<std::sync::Mutex<HashSet<String>>>,
-        tx: &mpsc::Sender<WatchEvent>,
+        tx: &mpsc::UnboundedSender<WatchEvent>,
     ) -> Result<()> {
-        for dir in [corpus_dir, crash_dir] {
+        // Walk the dirs recursively, matching the live watcher's recursive mode,
+        // so pre-existing files in nested layouts (syzkaller's crashes/<hash>/
+        // repro*) are caught on startup, not just flat dirs like AFL's queue.
+        // Dedupe the roots so a libFuzzer-style profile (corpus == crash dir) is
+        // not walked twice.
+        let mut stack = vec![corpus_dir.to_path_buf()];
+        if crash_dir != corpus_dir {
+            stack.push(crash_dir.to_path_buf());
+        }
+        while let Some(dir) = stack.pop() {
             if !dir.exists() {
                 continue;
             }
-            let is_crash = dir == crash_dir;
-            for entry in std::fs::read_dir(dir)? {
-                let entry = entry?;
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
                 let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
                 if !path.is_file() {
+                    continue;
+                }
+                let role = profile.classify(&path, corpus_dir, crash_dir);
+                if role == FileRole::Ignore {
                     continue;
                 }
                 let data = std::fs::read(&path)?;
@@ -128,10 +186,14 @@ impl DirWatcher {
                     }
                     seen.insert(hash.clone());
                 }
-                if is_crash {
-                    let _ = tx.try_send(WatchEvent::NewCrash { path, data });
-                } else {
-                    let _ = tx.try_send(WatchEvent::NewSeed { path, hash, data });
+                match role {
+                    FileRole::Crash => {
+                        let _ = tx.send(WatchEvent::NewCrash { path, data });
+                    }
+                    FileRole::Seed => {
+                        let _ = tx.send(WatchEvent::NewSeed { path, hash, data });
+                    }
+                    FileRole::Ignore => {}
                 }
             }
         }
@@ -140,6 +202,14 @@ impl DirWatcher {
 
     pub fn mark_seen(&self, hash: &str) {
         self.seen_hashes.lock().unwrap().insert(hash.to_string());
+    }
+
+    // Forget a hash so the next scan or notify event re-discovers and re-sends
+    // it. The loop calls this when an upload fails, so a transient coordinator
+    // outage does not permanently drop a seed or crash that was marked seen at
+    // discovery time (the dedup set is updated before the upload is attempted).
+    pub fn mark_unseen(&self, hash: &str) {
+        self.seen_hashes.lock().unwrap().remove(hash);
     }
 }
 
@@ -159,7 +229,9 @@ mod tests {
         fs::write(crashes.join("crash1"), b"boom").unwrap();
 
         let watcher = DirWatcher::new();
-        let mut rx = watcher.watch(&corpus, &crashes).unwrap();
+        let (_guard, mut rx) = watcher
+            .watch(&corpus, &crashes, &crate::profile::FuzzerProfile::aflpp())
+            .unwrap();
 
         let mut got_seed = false;
         let mut got_crash = false;

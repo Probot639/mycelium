@@ -1,0 +1,49 @@
+{{- if .Values.inoculate.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "mycelium.fullname" . }}-inoculate
+  labels:
+    {{- include "mycelium.labels" . | nindent 4 }}
+    app.kubernetes.io/component: inoculate
+  annotations:
+    # Run after the coordinator exists. post-install/upgrade keeps it out of the
+    # normal apply order, and the hook-succeeded policy cleans the pod up.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "mycelium.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: inoculate
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: inoculate
+          image: {{ include "mycelium.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Upload the harness baked into the image and create the campaign. The
+          # harness must exist at harnessPath; the chart does not ship one.
+          command:
+            - mycelium
+            - inoculate
+            - "--coordinator"
+            - {{ include "mycelium.coordinatorAddr" . | quote }}
+            - "--campaign"
+            - {{ .Values.campaign.name | quote }}
+            - "--harness"
+            - {{ .Values.inoculate.harnessPath | quote }}
+            - "--fuzzer"
+            - {{ .Values.inoculate.fuzzer | quote }}
+            - "--"
+            {{- range .Values.inoculate.command }}
+            - {{ . | quote }}
+            {{- end }}
+{{- end }}

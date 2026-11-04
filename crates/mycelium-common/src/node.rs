@@ -26,6 +26,11 @@ pub struct NodeInfo {
     pub fuzzer: String,
     pub priority: Priority,
     pub status: NodeStatus,
+    /// True when the node's fuzzer has an overall time or run limit, so a
+    /// `suspended` status after it stops means "finished its bounded run"
+    /// rather than "drained by hand". Persistent fuzzers report false.
+    #[serde(default)]
+    pub time_limited: bool,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub last_sync: chrono::DateTime<chrono::Utc>,
 }

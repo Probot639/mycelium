@@ -70,7 +70,7 @@
 
   <table>
     <thead>
-      <tr><th>node</th><th>host</th><th>fuzzer</th><th>priority</th><th>status</th><th>last sync</th></tr>
+      <tr><th>node</th><th>host</th><th>fuzzer</th><th>priority</th><th>status</th><th>run</th><th>last sync</th></tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
@@ -100,6 +100,13 @@ function stat(k, n, cls) {
   return `<div class="stat ${cls||""}"><div class="n">${n}</div><div class="k">${k}</div></div>`;
 }
 
+// node hostname/fuzzer/id are node-supplied and not HTML-safe, so escape before
+// putting them in innerHTML (a malicious node could otherwise XSS the dashboard)
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 async function scry() {
   let data;
   try {
@@ -121,6 +128,7 @@ async function scry() {
   document.getElementById("totals").innerHTML =
     stat("corpus", c.total_corpus ?? 0) +
     stat("crashes", c.total_crashes ?? 0, "crash") +
+    stat("bugs", c.unique_bugs ?? 0, "bug") +
     stat("execs/sec", c.total_execs_per_sec ?? 0) +
     stat("nodes", c.nodes_online ?? 0);
 
@@ -134,11 +142,12 @@ async function scry() {
   empty.hidden = true;
   rows.innerHTML = nodes.map(n => `
     <tr>
-      <td class="id">${n.id}</td>
-      <td>${n.hostname}</td>
-      <td>${n.fuzzer}</td>
-      <td class="pri">${n.priority}</td>
-      <td><span class="dot ${n.status}"></span>${n.status}</td>
+      <td class="id">${esc(n.id)}</td>
+      <td>${esc(n.hostname)}</td>
+      <td>${esc(n.fuzzer)}</td>
+      <td class="pri">${esc(n.priority)}</td>
+      <td><span class="dot ${esc(n.status)}"></span>${esc(n.status)}</td>
+      <td class="pri">${n.time_limited ? "timed" : "persist"}</td>
       <td>${hhmmss(n.last_sync)}</td>
     </tr>`).join("");
 }

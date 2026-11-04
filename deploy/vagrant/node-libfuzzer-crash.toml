@@ -1,0 +1,19 @@
+# libFuzzer crash-dedup validation node. -fork=1 -ignore_crashes=1 keeps the
+# run going after each crash so multiple crashing inputs accumulate. triage_cmd
+# re-runs each crash file through the same binary to capture the sanitizer trace,
+# which drives the per-bug stack hash. Replace COORD.
+
+[node]
+coordinator = "COORD:7100"
+priority = "shared"
+
+[fuzzer]
+name = "libfuzzer"
+command = ["/opt/lfc/harness_crash", "/opt/lfc/corpus", "-fork=1", "-ignore_crashes=1", "-artifact_prefix=/opt/lfc/corpus/", "-max_total_time=120"]
+corpus_dir = "/opt/lfc/corpus"
+crash_dir = "/opt/lfc/corpus"
+triage_cmd = ["/opt/lfc/harness_crash", "{file}"]
+
+[circle]
+sync_interval = "8s"
+inject_dir = "/opt/lfc/corpus"

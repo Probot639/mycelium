@@ -6,11 +6,41 @@ use anyhow::Result;
 use mycelium_common::corpus::{hash_bytes, CrashEntry, Seed};
 use mycelium_common::protocol::*;
 
+#[derive(Clone)]
 pub struct SyncClient {
     client: reqwest::Client,
     coordinator_url: String,
     node_id: String,
     campaign: String,
+}
+
+// The sync-loop client's request timeout. Kept short on purpose: pull, push and
+// heartbeat all run from the one select! loop, so a request that hangs on a slow
+// or dead coordinator stalls the whole loop (lapsing the heartbeat, letting the
+// watcher's unbounded channel grow). Failing fast lets the loop keep draining
+// and keep heartbeating; a dropped seed batch is recovered on the next tick.
+const LOOP_TIMEOUT_SECS: u64 = 20;
+// Base-corpus and harness uploads can be large (tens of MB) and run once, off
+// the loop, so they get a generous timeout instead.
+const UPLOAD_TIMEOUT_SECS: u64 = 300;
+
+// Build an HTTP client that carries the coordinator bearer token from
+// MYCELIUM_TOKEN, if set. Symmetric with the coordinator: both read the same
+// env var, so a node on a secured coordinator just needs that var exported.
+fn client_with_auth() -> reqwest::Client {
+    client_with_timeout(LOOP_TIMEOUT_SECS)
+}
+
+fn client_with_timeout(timeout_secs: u64) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
+    if let Some(token) = std::env::var("MYCELIUM_TOKEN").ok().filter(|s| !s.is_empty())
+        && let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+    {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, val);
+        builder = builder.default_headers(headers);
+    }
+    builder.build().expect("failed to build http client")
 }
 
 impl SyncClient {
@@ -21,10 +51,7 @@ impl SyncClient {
             format!("http://{coordinator_url}")
         };
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("failed to build http client"),
+            client: client_with_auth(),
             coordinator_url: base,
             node_id: node_id.to_string(),
             campaign: campaign.to_string(),
@@ -38,13 +65,15 @@ impl SyncClient {
         campaign: &str,
         fuzzer: &str,
         priority: mycelium_common::node::Priority,
+        requested_id: Option<String>,
+        time_limited: bool,
     ) -> Result<String> {
         let base = if coordinator_url.starts_with("http") {
             coordinator_url.to_string()
         } else {
             format!("http://{coordinator_url}")
         };
-        let client = reqwest::Client::new();
+        let client = client_with_auth();
         let resp = client
             .post(format!("{base}/register"))
             .json(&RegisterRequest {
@@ -52,6 +81,8 @@ impl SyncClient {
                 campaign: campaign.into(),
                 fuzzer: fuzzer.into(),
                 priority,
+                requested_id,
+                time_limited,
             })
             .send()
             .await?
@@ -81,13 +112,41 @@ impl SyncClient {
         Ok(())
     }
 
+    // Push a burst of seeds in one request, so a fast fuzzer is not bottlenecked
+    // on one HTTP round-trip per seed.
+    pub async fn push_seeds_batch(&self, items: Vec<(String, Vec<u8>)>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let seeds: Vec<Seed> = items
+            .into_iter()
+            .map(|(hash, data)| Seed {
+                hash,
+                data,
+                source_node: self.node_id.clone(),
+                campaign: self.campaign.clone(),
+                found_at: chrono::Utc::now(),
+            })
+            .collect();
+        self.client
+            .post(format!("{}/seed/push/batch", self.coordinator_url))
+            .json(&PushSeedBatchRequest {
+                node_id: self.node_id.clone(),
+                seeds,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     pub async fn pull_seeds(&self) -> Result<Vec<Seed>> {
         let resp = self
             .client
             .post(format!("{}/seed/pull", self.coordinator_url))
             .json(&PullSeedsRequest {
                 node_id: self.node_id.clone(),
-                known_hashes: vec![],
+                campaign: self.campaign.clone(),
             })
             .send()
             .await?
@@ -99,15 +158,11 @@ impl SyncClient {
 
     pub async fn report_crash(&self, data: Vec<u8>, sanitizer_output: &str) -> Result<()> {
         let input_hash = hash_bytes(&data);
-        // Simple stack hash: hash the first 3 non-empty lines of sanitizer output
-        let stack_hash = {
-            let lines: Vec<&str> = sanitizer_output
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(3)
-                .collect();
-            hash_bytes(lines.join("\n").as_bytes())
-        };
+        // Per-bug hash from the trace's error class and top frames. With no
+        // usable trace, fall back to the input hash so traceless crashes stay
+        // distinct instead of all collapsing onto one value.
+        let stack_hash = mycelium_common::triage::stack_hash(sanitizer_output)
+            .unwrap_or_else(|| input_hash.clone());
         let crash = CrashEntry {
             stack_hash,
             input_hash,
@@ -176,7 +231,7 @@ impl SyncClient {
         } else {
             format!("http://{coordinator_url}")
         };
-        reqwest::Client::new()
+        client_with_auth()
             .post(format!("{base}/campaign"))
             .json(&mycelium_common::protocol::CreateCampaignRequest {
                 name: name.into(),
@@ -189,6 +244,41 @@ impl SyncClient {
         Ok(())
     }
 
+    // Upload base-corpus seeds for a campaign before any node joins. They are
+    // tagged with a synthetic source so every real node receives them.
+    pub async fn upload_seeds(
+        coordinator_url: &str,
+        campaign: &str,
+        seeds: Vec<(String, Vec<u8>)>,
+    ) -> Result<usize> {
+        let base = if coordinator_url.starts_with("http") {
+            coordinator_url.to_string()
+        } else {
+            format!("http://{coordinator_url}")
+        };
+        let seed_structs: Vec<Seed> = seeds
+            .into_iter()
+            .map(|(hash, data)| Seed {
+                hash,
+                data,
+                source_node: "campaign-seed".into(),
+                campaign: campaign.into(),
+                found_at: chrono::Utc::now(),
+            })
+            .collect();
+        let n = seed_structs.len();
+        client_with_timeout(UPLOAD_TIMEOUT_SECS)
+            .post(format!("{base}/seed/push/batch"))
+            .json(&PushSeedBatchRequest {
+                node_id: "campaign-seed".into(),
+                seeds: seed_structs,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(n)
+    }
+
     pub async fn upload_harness(
         coordinator_url: &str,
         campaign: &str,
@@ -199,7 +289,7 @@ impl SyncClient {
         } else {
             format!("http://{coordinator_url}")
         };
-        reqwest::Client::new()
+        client_with_timeout(UPLOAD_TIMEOUT_SECS)
             .put(format!("{base}/campaign/{campaign}/harness"))
             .body(data)
             .send()
@@ -217,7 +307,9 @@ impl SyncClient {
         } else {
             format!("http://{coordinator_url}")
         };
-        let bytes = reqwest::get(format!("{base}/campaign/{campaign}/harness"))
+        let bytes = client_with_timeout(UPLOAD_TIMEOUT_SECS)
+            .get(format!("{base}/campaign/{campaign}/harness"))
+            .send()
             .await?
             .error_for_status()?
             .bytes()
@@ -234,7 +326,9 @@ impl SyncClient {
         } else {
             format!("http://{coordinator_url}")
         };
-        let info = reqwest::get(format!("{base}/campaign/{campaign}"))
+        let info = client_with_auth()
+            .get(format!("{base}/campaign/{campaign}"))
+            .send()
             .await?
             .error_for_status()?
             .json()

@@ -1,0 +1,44 @@
+mycelium is installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Coordinator Service: {{ include "mycelium.fullname" . }}-coordinator ({{ .Values.coordinator.service.type }}, port {{ .Values.coordinator.service.port }})
+In-cluster address:  {{ include "mycelium.coordinatorAddr" . }}
+
+1. Watch the coordinator come up:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mycelium.fullname" . }}-coordinator
+
+{{- if not .Values.inoculate.enabled }}
+
+2. Create the campaign and upload a harness. Run this once, from a machine that
+   has the harness binary and the mycelium CLI. Reach the coordinator with a
+   port-forward:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "mycelium.fullname" . }}-coordinator {{ .Values.coordinator.service.port }}:{{ .Values.coordinator.service.port }}
+
+   mycelium inoculate --coordinator localhost:{{ .Values.coordinator.service.port }} \
+     --campaign {{ .Values.campaign.name }} \
+     --harness ./your_harness \
+     --fuzzer aflpp \
+     -- afl-fuzz -i {corpus} -o {output} -M main -F {inject} -- {harness}
+{{- else }}
+
+2. The inoculate Job ran as a post-install hook and created campaign
+   "{{ .Values.campaign.name }}" from the harness at {{ .Values.inoculate.harnessPath }}.
+{{- end }}
+
+{{- if .Values.fuzzer.enabled }}
+
+3. {{ .Values.fuzzer.replicas }} fuzzer pod(s) are joining campaign "{{ .Values.campaign.name }}" in distributed mode.
+   They download the harness from the coordinator, so the image needs no rebuild
+   per target. Check them:
+
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=fuzzer
+{{- else }}
+
+3. The fuzzer workload is disabled (fuzzer.enabled=false). Enable it after the
+   campaign exists, or run nodes outside the cluster.
+{{- end }}
+
+4. Check campaign status (through the same port-forward):
+
+   mycelium probe --coordinator localhost:{{ .Values.coordinator.service.port }} --nodes

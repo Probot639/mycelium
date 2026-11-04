@@ -1,0 +1,77 @@
+{{- if .Values.fuzzer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mycelium.fullname" . }}-fuzzer
+  labels:
+    {{- include "mycelium.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fuzzer
+spec:
+  # A fuzzer pod runs until killed, so a Deployment fits better than a Job: no
+  # completion count, and k8s keeps the desired replica count alive. Scale this
+  # to the number of boxes you want fuzzing; each pod registers its own node ID.
+  replicas: {{ .Values.fuzzer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "mycelium.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: fuzzer
+  template:
+    metadata:
+      labels:
+        {{- include "mycelium.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: fuzzer
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: fuzzer
+          image: {{ include "mycelium.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Distributed mode: pull the harness and fuzzer command from the
+          # coordinator, write everything under the emptyDir /work. No per-target
+          # image rebuild needed.
+          command:
+            - mycelium
+            - join
+            - "--coordinator"
+            - {{ include "mycelium.coordinatorAddr" . | quote }}
+            - "--campaign"
+            - {{ .Values.campaign.name | quote }}
+            - "--workdir"
+            - /work
+            - "--priority"
+            - {{ .Values.campaign.priority | quote }}
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+          resources:
+            requests:
+              # No CPU limit on purpose. A limit makes the kernel CFS-throttle
+              # the fuzzer, which cuts execs/sec hard. Request cores, let it burst.
+              cpu: {{ .Values.fuzzer.resources.requests.cpu | quote }}
+              memory: {{ .Values.fuzzer.resources.requests.memory }}
+            limits:
+              memory: {{ .Values.fuzzer.resources.limits.memory }}
+      volumes:
+        - name: workdir
+          emptyDir:
+            sizeLimit: {{ .Values.fuzzer.workdirSize }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
