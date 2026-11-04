@@ -49,8 +49,14 @@ impl DirWatcher {
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in event.paths {
-                        if !path.is_file() {
-                            continue;
+                        // Only read a real file, never a symlink: the fuzz target
+                        // is the one untrusted writer in the watched tree, and a
+                        // symlink it drops (queue/x -> /etc/shadow) would otherwise
+                        // be read and uploaded as a "seed". symlink_metadata does
+                        // not follow the link, so a symlink is skipped outright.
+                        match std::fs::symlink_metadata(&path) {
+                            Ok(m) if m.is_file() => {}
+                            _ => continue,
                         }
                         let Ok(data) = std::fs::read(&path) else {
                             continue;
@@ -113,7 +119,25 @@ impl DirWatcher {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
                 let path = entry.path();
+<<<<<<< Updated upstream
                 if !path.is_file() {
+=======
+                // DirEntry::file_type does not follow symlinks, so skip a symlink
+                // instead of reading its target or walking into a symlinked dir
+                // (same exfiltration concern as the live watcher).
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+>>>>>>> Stashed changes
                     continue;
                 }
                 let data = std::fs::read(&path)?;
@@ -177,5 +201,39 @@ mod tests {
 
         assert!(got_seed);
         assert!(got_crash);
+    }
+
+    #[tokio::test]
+    async fn scan_skips_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = tmp.path().join("corpus");
+        let crashes = tmp.path().join("crashes");
+        fs::create_dir_all(&corpus).unwrap();
+        fs::create_dir_all(&crashes).unwrap();
+        // a secret the fuzz target must not be able to exfiltrate via a symlink
+        let secret = tmp.path().join("secret");
+        fs::write(&secret, b"TOP-SECRET-CONTENTS").unwrap();
+        fs::write(corpus.join("real-seed"), b"ordinary seed").unwrap();
+        std::os::unix::fs::symlink(&secret, corpus.join("sneaky")).unwrap();
+
+        let watcher = DirWatcher::new();
+        let (_guard, mut rx) = watcher
+            .watch(&corpus, &crashes, &crate::profile::FuzzerProfile::aflpp())
+            .unwrap();
+
+        let mut saw_real = false;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            let data = match event {
+                WatchEvent::NewSeed { data, .. } => data,
+                WatchEvent::NewCrash { data, .. } => data,
+            };
+            assert_ne!(data, b"TOP-SECRET-CONTENTS", "symlink target was read and emitted");
+            if data == b"ordinary seed" {
+                saw_real = true;
+            }
+        }
+        assert!(saw_real, "the real seed should still be picked up");
     }
 }

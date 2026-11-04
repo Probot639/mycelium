@@ -158,6 +158,15 @@ impl SyncClient {
     }
 
     pub fn inject_seed(&self, inject_dir: &Path, seed: &Seed) -> Result<()> {
+        // The hash becomes a path component, and it arrives from the coordinator,
+        // so re-validate it node-side before the join: a value like
+        // "../../.ssh/authorized_keys" would otherwise write attacker bytes
+        // outside inject_dir. The coordinator validates on ingest too, but the
+        // node does not get to assume that.
+        anyhow::ensure!(
+            mycelium_common::validate::is_valid_hash(&seed.hash),
+            "refusing to inject seed with non-hash name"
+        );
         let path = inject_dir.join(&seed.hash);
         if !path.exists() {
             std::fs::write(&path, &seed.data)?;
@@ -240,5 +249,34 @@ impl SyncClient {
             .json()
             .await?;
         Ok(info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed_with_hash(hash: &str) -> Seed {
+        Seed {
+            hash: hash.into(),
+            data: b"payload".to_vec(),
+            source_node: "n".into(),
+            campaign: "c".into(),
+            found_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn inject_rejects_traversal_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = SyncClient::new("http://127.0.0.1:1", "n", "c");
+        // a coordinator-supplied hash that is really a path must be refused
+        let bad = seed_with_hash("../../escape");
+        assert!(client.inject_seed(tmp.path(), &bad).is_err());
+        assert!(!tmp.path().parent().unwrap().join("escape").exists());
+        // a real content hash is written as a plain file under inject_dir
+        let good = seed_with_hash(&"a".repeat(64));
+        assert!(client.inject_seed(tmp.path(), &good).is_ok());
+        assert!(tmp.path().join("a".repeat(64)).exists());
     }
 }
