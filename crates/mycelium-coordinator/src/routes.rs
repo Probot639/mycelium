@@ -8,18 +8,60 @@ use axum::Json;
 
 use mycelium_common::node::{NodeInfo, NodeStatus};
 use mycelium_common::protocol::*;
+use mycelium_common::validate;
 
 use crate::state::CoordinatorState;
 
 type AppState = Arc<CoordinatorState>;
 
+// Bearer-token gate for the write and harness endpoints. When the coordinator
+// has no token set it lets everything through, which is the old open behavior.
+pub async fn require_auth(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(expected) = &state.auth_token {
+        let provided = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+        let ok = provided.map(|p| ct_eq(p, expected)).unwrap_or(false);
+        if !ok {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    next.run(req).await
+}
+
+// Constant-time string compare, so token validation does not leak the matching
+// prefix length through response timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    // 4 hex chars from uuid4 gives us ~65k unique IDs per hostname, good enough
-    let short = &uuid::Uuid::new_v4().to_string()[..4];
-    let node_id = format!("{}-{short}", req.hostname);
+    // reuse the node's persisted id when it sent a valid one, so a restart keeps
+    // its distribution history; otherwise mint a fresh hostname-xxxx
+    let node_id = match req.requested_id.as_deref() {
+        Some(id) if validate::is_valid_campaign(id) => id.to_string(),
+        _ => {
+            let short = &uuid::Uuid::new_v4().to_string()[..4];
+            format!("{}-{short}", req.hostname)
+        }
+    };
     let info = NodeInfo {
         id: node_id.clone(),
         hostname: req.hostname,
@@ -27,6 +69,7 @@ pub async fn register(
         fuzzer: req.fuzzer,
         priority: req.priority,
         status: NodeStatus::Online,
+        time_limited: req.time_limited,
         last_sync: chrono::Utc::now(),
     };
     match state.register_node(&info) {
@@ -45,6 +88,12 @@ pub async fn push_seed(
     State(state): State<AppState>,
     Json(req): Json<PushSeedRequest>,
 ) -> StatusCode {
+    // the hash becomes a path component on disk, so reject anything that is not
+    // a clean content hash before it gets there
+    if !validate::is_valid_hash(&req.seed.hash) {
+        tracing::warn!(from = %req.node_id, "rejected seed with invalid hash");
+        return StatusCode::BAD_REQUEST;
+    }
     match state.ingest_seed(&req.seed) {
         Ok(true) => {
             tracing::debug!(hash = %req.seed.hash, from = %req.node_id, "new seed");
@@ -58,23 +107,38 @@ pub async fn push_seed(
     }
 }
 
+pub async fn push_seed_batch(
+    State(state): State<AppState>,
+    Json(req): Json<PushSeedBatchRequest>,
+) -> StatusCode {
+    let mut new = 0u64;
+    for seed in &req.seeds {
+        // the state layer validates the hash; a bad seed is skipped, not fatal
+        // to the batch
+        match state.ingest_seed(seed) {
+            Ok(true) => new += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, from = %req.node_id, "skipped bad seed in batch"),
+        }
+    }
+    if new > 0 {
+        tracing::debug!(count = req.seeds.len(), new, from = %req.node_id, "seed batch");
+    }
+    StatusCode::OK
+}
+
 pub async fn pull_seeds(
     State(state): State<AppState>,
     Json(req): Json<PullSeedsRequest>,
 ) -> impl IntoResponse {
-    // TODO: the circle should just send its campaign in the request instead
-    // of us looking it up from the node table every time
-    let campaign = {
-        let nodes = state.list_nodes(None).unwrap_or_default();
-        nodes
-            .iter()
-            .find(|n| n.id == req.node_id)
-            .map(|n| n.campaign.clone())
-            .unwrap_or_default()
+    // Bind the pull to the node's registered campaign, not the campaign in the
+    // request, so a node cannot read a campaign it did not join.
+    let campaign = match state.node_campaign(&req.node_id) {
+        Ok(Some(c)) => c,
+        _ => {
+            return (StatusCode::NOT_FOUND, Json(PullSeedsResponse { seeds: vec![] })).into_response();
+        }
     };
-    if campaign.is_empty() {
-        return (StatusCode::NOT_FOUND, Json(PullSeedsResponse { seeds: vec![] })).into_response();
-    }
     match state.get_seeds_for_node(&req.node_id, &campaign) {
         Ok(seeds) => {
             if !seeds.is_empty() {
@@ -97,6 +161,11 @@ pub async fn report_crash(
     State(state): State<AppState>,
     Json(req): Json<ReportCrashRequest>,
 ) -> StatusCode {
+    // stack_hash becomes a directory name on disk; both hashes must be clean
+    if !validate::is_valid_hash(&req.crash.stack_hash) || !validate::is_valid_hash(&req.crash.input_hash) {
+        tracing::warn!(from = %req.node_id, "rejected crash with invalid hash");
+        return StatusCode::BAD_REQUEST;
+    }
     match state.ingest_crash(&req.crash) {
         Ok(is_new) => {
             if is_new {
@@ -152,6 +221,7 @@ pub async fn scry(State(state): State<AppState>) -> Json<ScryResponse> {
             name: campaign_name.to_string(),
             total_corpus: 0,
             total_crashes: 0,
+            unique_bugs: 0,
             total_execs_per_sec: 0,
             nodes_online: 0,
         });
@@ -162,7 +232,15 @@ pub async fn deregister(
     State(state): State<AppState>,
     Json(req): Json<DeregisterRequest>,
 ) -> StatusCode {
-    match state.deregister_node(&req.node_id) {
+    // Graceful drain suspends the node but keeps its corpus, crashes, and
+    // distribution history, so it does not re-pull everything if it comes back.
+    // A hard deregister removes the node and its distribution rows outright.
+    let result = if req.drain {
+        state.set_node_status(&req.node_id, mycelium_common::node::NodeStatus::Suspended)
+    } else {
+        state.deregister_node(&req.node_id)
+    };
+    match result {
         Ok(()) => {
             tracing::info!(node_id = %req.node_id, drain = req.drain, "node left");
             StatusCode::OK
@@ -178,7 +256,7 @@ pub async fn create_campaign(
     State(state): State<AppState>,
     Json(req): Json<CreateCampaignRequest>,
 ) -> impl IntoResponse {
-    if req.name.is_empty() || req.fuzzer_command.is_empty() {
+    if !validate::is_valid_campaign(&req.name) || req.fuzzer_command.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     match state.create_campaign(&req.name, &req.fuzzer_name, &req.fuzzer_command) {
@@ -197,6 +275,9 @@ pub async fn get_campaign(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if !validate::is_valid_campaign(&name) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     match state.get_campaign(&name) {
         Ok(Some(info)) => (StatusCode::OK, Json(info)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -212,7 +293,7 @@ pub async fn upload_harness(
     Path(name): Path<String>,
     body: Bytes,
 ) -> StatusCode {
-    if body.is_empty() {
+    if body.is_empty() || !validate::is_valid_campaign(&name) {
         return StatusCode::BAD_REQUEST;
     }
     // campaign must exist before you can upload a harness for it
@@ -237,6 +318,9 @@ pub async fn download_harness(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if !validate::is_valid_campaign(&name) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     match state.get_harness(&name) {
         Ok(Some(data)) => (
             StatusCode::OK,

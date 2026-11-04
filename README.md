@@ -1,5 +1,9 @@
 # mycelium
 
+<p align="center">
+  <img src="docs/mycelium.png" width="360" alt="mycelium: a mushroom whose underground hyphae reach down to a dragon, a rabbit, and a Google G">
+</p>
+
 Universal harness for distributed fuzzing.
 
 You write one AFL++ harness (or Honggfuzz, or whatever), mycelium runs it on N boxes and keeps the corpus in sync. Each instance thinks it's running locally.
@@ -33,10 +37,10 @@ mycelium inoculate --coordinator sigil:7100 \
   --campaign fuzz-libpng \
   --harness ./fuzz_png \
   --fuzzer aflpp \
-  -- afl-fuzz -i {corpus} -o {output} -- {harness}
+  -- afl-fuzz -i {corpus} -o {output} -M main -F {inject} -- {harness}
 ```
 
-`{harness}`, `{corpus}`, and `{output}` are placeholders. Each node fills them in with local paths.
+`{harness}`, `{corpus}`, `{output}`, and `{inject}` are placeholders. Each node fills them in with local paths. For AFL++ the command must run a main instance (`-M main`) and import the injected foreign corpus (`-F {inject}`), so that seeds pulled from peers reach the running fuzzer. Without `-F {inject}` a node still fuzzes, but it only works from its own inputs.
 
 On each fuzzing node, join the campaign. The node downloads the harness, creates working directories, and starts the fuzzer:
 
@@ -68,11 +72,11 @@ mycelium probe --coordinator sigil:7100 --nodes
 Campaign: fuzz-libpng
   corpus: 1423  crashes: 7  nodes: 4
 
-NODE             HOST         FUZZER       STATUS       LAST SYNC
-sigil-a1f2       sigil        aflpp        online       14:32:07
-songbird-b3e4    songbird     aflpp        online       14:32:05
-glyph-c5d6       glyph        aflpp        online       14:31:58
-tarot-d7e8       tarot        aflpp        online       14:32:01
+NODE             HOST         FUZZER       PRIORITY   STATUS       LAST SYNC
+sigil-a1f2       sigil        aflpp        dedicated  online       14:32:07
+songbird-b3e4    songbird     aflpp        shared     online       14:32:05
+glyph-c5d6       glyph        aflpp        shared     online       14:31:58
+tarot-d7e8       tarot        aflpp        idle       online       14:32:01
 ```
 
 For machine-readable output (useful for automation):
@@ -148,8 +152,9 @@ Used in the `inoculate` fuzzer command:
 | Placeholder | Expanded to |
 |---|---|
 | `{harness}` | Path to the downloaded harness binary |
-| `{corpus}` | Input corpus directory |
+| `{corpus}` | Input seed directory (the fuzzer's `-i`) |
 | `{output}` | Fuzzer output directory |
+| `{inject}` | Foreign-corpus directory for pulled seeds (the fuzzer's `-F`) |
 
 ## License
 

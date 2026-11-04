@@ -1,4 +1,14 @@
-# PoC - untested
+# Manual-mode node config. Only needed when the harness and seeds already live
+# on the fuzzing image (the --config path). The Helm chart's default fuzzer
+# workload uses distributed mode instead and does not read this file.
+#
+# AFL++ wiring that actually syncs:
+#   -i /work/seeds   read once at startup. Pre-populate it; AFL++ refuses to
+#                    start on an empty input dir.
+#   -F /work/inject  foreign corpus, re-scanned while running. mycelium drops
+#                    pulled seeds here (inject_dir), so they reach the live
+#                    fuzzer. Injecting into -i would not: AFL++ reads -i once.
+#   -M main          named main instance, so its output lands in output/main/.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,11 +20,11 @@ data:
 
     [fuzzer]
     name = "aflpp"
-    command = ["afl-fuzz", "-i", "/work/corpus", "-o", "/work/output", "--", "/work/target"]
-    corpus_dir = "/work/output/default/queue"
-    crash_dir = "/work/output/default/crashes"
-    stats_file = "/work/output/default/fuzzer_stats"
+    command = ["afl-fuzz", "-i", "/work/seeds", "-o", "/work/output", "-M", "main", "-F", "/work/inject", "--", "/work/target"]
+    corpus_dir = "/work/output/main/queue"
+    crash_dir = "/work/output/main/crashes"
+    stats_file = "/work/output/main/fuzzer_stats"
 
     [circle]
     sync_interval = "30s"
-    inject_dir = "/work/corpus"
+    inject_dir = "/work/inject"

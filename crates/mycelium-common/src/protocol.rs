@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::corpus::{CrashEntry, Seed};
-use crate::node::{NodeInfo, NodeStatus, Priority};
+use crate::node::{NodeInfo, Priority};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -9,6 +9,15 @@ pub struct RegisterRequest {
     pub campaign: String,
     pub fuzzer: String,
     pub priority: Priority,
+    /// A stable id the node persists across restarts. When present and valid the
+    /// coordinator reuses it, so a restarted node keeps its seed-distribution
+    /// history instead of re-pulling the whole corpus.
+    #[serde(default)]
+    pub requested_id: Option<String>,
+    /// True when the fuzzer command has an overall time or run limit (so the
+    /// node is expected to finish on its own and then suspend).
+    #[serde(default)]
+    pub time_limited: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,10 +32,17 @@ pub struct PushSeedRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct PushSeedBatchRequest {
+    pub node_id: String,
+    pub seeds: Vec<Seed>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PullSeedsRequest {
     pub node_id: String,
-    // not used yet, but the circle could send these to avoid re-downloading
-    pub known_hashes: Vec<String>,
+    // the node sends its own campaign so the coordinator does not have to scan
+    // the whole nodes table to find it on every pull
+    pub campaign: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +75,9 @@ pub struct CampaignStatus {
     pub name: String,
     pub total_corpus: u64,
     pub total_crashes: u64,
+    /// Distinct bugs by stack hash. Below total_crashes once traces dedup them.
+    #[serde(default)]
+    pub unique_bugs: u64,
     pub total_execs_per_sec: u64,
     pub nodes_online: u64,
 }
@@ -67,12 +86,6 @@ pub struct CampaignStatus {
 pub struct DeregisterRequest {
     pub node_id: String,
     pub drain: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StatusUpdate {
-    pub node_id: String,
-    pub status: NodeStatus,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

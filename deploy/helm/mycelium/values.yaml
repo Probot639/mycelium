@@ -1,0 +1,96 @@
+# Default values for the mycelium chart.
+
+image:
+  # Where the mycelium image lives. On a local cluster (kind, k3d, minikube,
+  # microk8s, k3s) this is the tag you loaded into the node, so pullPolicy
+  # should stay Never or IfNotPresent. For kubeadm/cloud, push to a registry
+  # the nodes can reach and set repo to that path.
+  repository: mycelium
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Extra image pull secrets, if you pull from a private registry.
+imagePullSecrets: []
+
+coordinator:
+  # The coordinator is a single process by design (one SQLite file). Leave at 1.
+  replicas: 1
+  service:
+    # ClusterIP keeps the coordinator inside the cluster. Switch to NodePort on
+    # a local cluster without a load balancer, or LoadBalancer where MetalLB or
+    # a cloud LB exists. The fuzzer pods reach it by Service DNS either way.
+    type: ClusterIP
+    port: 7100
+    # Only read when type is NodePort. Leave empty to let k8s pick one.
+    nodePort: ""
+  storage:
+    size: 10Gi
+    # Empty string uses the cluster default StorageClass. Set it explicitly on
+    # clusters without a default (some bare kubeadm installs have none).
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# The campaign the fuzzer pods join. Create it once with `mycelium inoculate`
+# after the coordinator is up (see deploy/README.md), or enable the one-shot
+# inoculate Job below.
+campaign:
+  name: default
+  # shared, dedicated, or idle. Controls how often each node pulls shared corpus.
+  priority: shared
+
+fuzzer:
+  # Turn the fuzzer workload off if you only want the coordinator running (for
+  # example while you inoculate a campaign, or when nodes live outside k8s).
+  enabled: true
+  # One pod per box you want fuzzing. Each registers its own node ID.
+  replicas: 3
+  # Distributed mode: pods download the harness from the coordinator, so the
+  # image never needs a per-target rebuild.
+  workdirSize: 5Gi
+  resources:
+    requests:
+      # Fuzzing is CPU-bound. Request whole cores so the scheduler reserves
+      # them, but set no CPU limit: a limit makes k8s CFS-throttle the fuzzer
+      # mid-run, which tanks execs/sec. Memory gets a limit, CPU does not.
+      cpu: "2"
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+# Optional one-shot Job that runs `mycelium inoculate` to create the campaign
+# and upload a harness. Off by default: inoculate is an operator step and needs
+# a harness binary, which the chart does not ship. See deploy/README.md for the
+# manual command. If you enable it, the harness must already live in the image
+# at the path below (bake it in, or mount it).
+inoculate:
+  enabled: false
+  fuzzer: aflpp
+  # Path to the harness binary inside the image.
+  harnessPath: /work/target
+  # AFL++ distributed-mode recipe. The main instance reads {corpus} once at
+  # start and imports the {inject} foreign dir while running, which is where
+  # mycelium drops pulled seeds. See the recipe note in deploy/README.md.
+  command:
+    - afl-fuzz
+    - "-i"
+    - "{corpus}"
+    - "-o"
+    - "{output}"
+    - "-M"
+    - main
+    - "-F"
+    - "{inject}"
+    - "--"
+    - "{harness}"
+
+# Scheduling knobs applied to both workloads.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

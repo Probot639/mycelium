@@ -1,0 +1,18 @@
+# Manual-mode node config for a libFuzzer target. The `libfuzzer` profile tells
+# mycelium that corpus and crash artifacts share one dir and crashes are named
+# crash-*/oom-*/timeout-*. -reload=1 makes libFuzzer re-read the corpus dir, so
+# seeds mycelium injects there reach the running fuzzer. Replace COORD.
+
+[node]
+coordinator = "COORD:7100"
+priority = "shared"
+
+[fuzzer]
+name = "libfuzzer"
+command = ["/opt/lf/harness_lf", "/opt/lf/corpus", "-reload=1", "-artifact_prefix=/opt/lf/corpus/"]
+corpus_dir = "/opt/lf/corpus"
+crash_dir = "/opt/lf/corpus"
+
+[circle]
+sync_interval = "10s"
+inject_dir = "/opt/lf/corpus"
