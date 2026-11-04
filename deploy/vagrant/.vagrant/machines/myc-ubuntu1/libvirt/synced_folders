@@ -1,0 +1,1 @@
+{"rsync":{"/vagrant":{"disabled":false,"guestpath":"/vagrant","hostpath":"/home/odessa/code/mycelium","type":"rsync","rsync__exclude":["target/",".git/",".local/","deploy/vagrant/.vagrant/"],"__vagrantfile":true,"exclude":["target/",".git/",".local/","deploy/vagrant/.vagrant/"],"owner":"vagrant","group":"vagrant"}}}

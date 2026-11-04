@@ -2,6 +2,21 @@ use serde::Deserialize;
 
 use mycelium_common::node::Priority;
 
+use crate::profile::FuzzerProfile;
+
+/// How a node supervises its fuzzer process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuzzerMode {
+    /// Run the fuzzer until it exits, then the node is done. Default.
+    Persistent,
+    /// The fuzzer exits once per round. The node pulls fresh corpus and
+    /// relaunches it after each round.
+    Round,
+    /// Do not launch a fuzzer at all. Watch the output dirs of a fuzzer managed
+    /// elsewhere and only sync corpus and crashes.
+    Api,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CircleConfig {
     pub node: NodeConfig,
@@ -12,14 +27,8 @@ pub struct CircleConfig {
 #[derive(Debug, Deserialize)]
 pub struct NodeConfig {
     pub coordinator: String,
-    #[serde(default = "default_id")]
-    pub id: String,
     #[serde(default)]
     pub priority: Priority,
-}
-
-fn default_id() -> String {
-    "auto".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +39,33 @@ pub struct FuzzerConfig {
     pub crash_dir: String,
     #[serde(default)]
     pub stats_file: Option<String>,
+    /// Command run on a crashing input to capture a sanitizer trace, with
+    /// `{file}` replaced by the input path. Its combined output becomes the
+    /// crash's trace and drives the per-bug stack hash. Point this at an
+    /// ASAN-instrumented build of the target (for libFuzzer, the fuzzer binary
+    /// itself works). With none set, crashes are reported without a trace and
+    /// deduped per input.
+    #[serde(default)]
+    pub triage_cmd: Option<Vec<String>>,
+    /// Script hooks for a custom fuzzer that file layout alone cannot drive.
+    #[serde(default)]
+    pub hooks: Hooks,
+}
+
+/// Escape hatches for fuzzers that are not purely file-driven. Both are
+/// optional: with neither set, the node drops pulled seeds into `inject_dir`
+/// and reads stats from `stats_file`, which covers the built-in profiles.
+#[derive(Debug, Default, Deserialize)]
+pub struct Hooks {
+    /// Run once per pulled seed to hand it to the fuzzer. The token `{file}` is
+    /// replaced with the path of the seed on disk. Use for a fuzzer that takes
+    /// new inputs through its own API or socket rather than a watched dir.
+    #[serde(default)]
+    pub import_cmd: Option<Vec<String>>,
+    /// Run each sync tick; its stdout is parsed by the stats parser. Use for a
+    /// fuzzer that reports progress to a command rather than a stats file.
+    #[serde(default)]
+    pub stats_cmd: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,8 +73,9 @@ pub struct CircleSettings {
     #[serde(default = "default_sync_interval")]
     pub sync_interval: String,
     pub inject_dir: String,
-    #[serde(default = "default_stats_parser")]
-    pub stats_parser: String,
+    /// Override the stats parser. Defaults to the one the fuzzer profile implies.
+    #[serde(default)]
+    pub stats_parser: Option<String>,
     #[serde(default = "default_mode")]
     pub mode: String,
 }
@@ -47,8 +84,21 @@ fn default_sync_interval() -> String {
     "30s".into()
 }
 
-fn default_stats_parser() -> String {
-    "aflpp".into()
+// Parse "30s" / "2m" / "1h" (or a bare integer, read as seconds) into seconds.
+// Returns None for anything that does not parse, so the caller can warn and fall
+// back once, rather than silently accepting a typo with an inconsistent default.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else {
+        (s, 1)
+    };
+    num.trim().parse::<u64>().ok().map(|v| v.saturating_mul(mult))
 }
 
 fn default_mode() -> String {
@@ -63,20 +113,39 @@ impl CircleConfig {
     }
 
     pub fn sync_interval_secs(&self) -> u64 {
-        let s = &self.circle.sync_interval;
-        if let Some(n) = s.strip_suffix('s') {
-            n.parse().unwrap_or(30)
-        } else if let Some(n) = s.strip_suffix('m') {
-            n.parse::<u64>().unwrap_or(1) * 60
-        } else {
-            s.parse().unwrap_or(30)
+        parse_duration_secs(&self.circle.sync_interval).unwrap_or_else(|| {
+            tracing::warn!(
+                value = %self.circle.sync_interval,
+                "unparseable sync_interval, falling back to 30s"
+            );
+            30
+        })
+    }
+
+    /// The configured fuzzer supervision mode. Unknown values fall back to
+    /// persistent so a typo does not wedge the node.
+    pub fn mode(&self) -> FuzzerMode {
+        match self.circle.mode.as_str() {
+            "round" => FuzzerMode::Round,
+            "api" | "external" => FuzzerMode::Api,
+            _ => FuzzerMode::Persistent,
         }
     }
 
-    pub fn resolve_path(&self, template: &str, corpus: &str, output: &str) -> String {
-        template
-            .replace("{corpus}", corpus)
-            .replace("{output}", output)
+    /// The fuzzer profile, selected by `[fuzzer] name`. Governs how the watcher
+    /// tells seeds from crashes from bookkeeping. Unknown names fall back to the
+    /// AFL++ layout.
+    pub fn profile(&self) -> FuzzerProfile {
+        FuzzerProfile::builtin(&self.fuzzer.name).unwrap_or_else(FuzzerProfile::aflpp)
+    }
+
+    /// Which stats parser to use for heartbeat reporting: the explicit config
+    /// value if set, otherwise the one the profile implies.
+    pub fn stats_parser(&self) -> String {
+        self.circle
+            .stats_parser
+            .clone()
+            .unwrap_or_else(|| self.profile().stats_parser)
     }
 }
 
@@ -111,6 +180,75 @@ mode = "persistent"
     }
 
     #[test]
+    fn custom_fuzzer_profile_and_hooks() {
+        let toml_str = r#"
+[node]
+coordinator = "x:7100"
+[fuzzer]
+name = "libfuzzer"
+command = ["./fuzz"]
+corpus_dir = "./corpus"
+crash_dir = "./corpus"
+[fuzzer.hooks]
+import_cmd = ["myctl", "add", "{file}"]
+stats_cmd = ["myctl", "stats"]
+[circle]
+inject_dir = "./corpus"
+"#;
+        let cfg: CircleConfig = toml::from_str(toml_str).unwrap();
+        // name selects the profile, which implies the stats parser
+        assert_eq!(cfg.profile().name, "libfuzzer");
+        assert_eq!(cfg.stats_parser(), "libfuzzer");
+        assert_eq!(cfg.fuzzer.hooks.import_cmd.as_ref().unwrap(), &["myctl", "add", "{file}"]);
+        assert!(cfg.fuzzer.hooks.stats_cmd.is_some());
+    }
+
+    #[test]
+    fn explicit_stats_parser_overrides_profile() {
+        let toml_str = r#"
+[node]
+coordinator = "x:7100"
+[fuzzer]
+name = "libfuzzer"
+command = ["./fuzz"]
+corpus_dir = "./c"
+crash_dir = "./c"
+[circle]
+inject_dir = "./c"
+stats_parser = "aflpp"
+"#;
+        let cfg: CircleConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.stats_parser(), "aflpp");
+    }
+
+    #[test]
+    fn mode_parses_and_defaults() {
+        let base = |mode: &str| {
+            format!(
+                r#"
+[node]
+coordinator = "x:7100"
+[fuzzer]
+name = "aflpp"
+command = ["afl-fuzz"]
+corpus_dir = "./q"
+crash_dir = "./c"
+[circle]
+inject_dir = "./i"
+mode = "{mode}"
+"#
+            )
+        };
+        let round: CircleConfig = toml::from_str(&base("round")).unwrap();
+        assert_eq!(round.mode(), FuzzerMode::Round);
+        let api: CircleConfig = toml::from_str(&base("api")).unwrap();
+        assert_eq!(api.mode(), FuzzerMode::Api);
+        // unknown or absent -> persistent
+        let typo: CircleConfig = toml::from_str(&base("wat")).unwrap();
+        assert_eq!(typo.mode(), FuzzerMode::Persistent);
+    }
+
+    #[test]
     fn sync_interval_minutes() {
         let toml_str = r#"
 [node]
@@ -128,5 +266,17 @@ sync_interval = "2m"
 "#;
         let config: CircleConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.sync_interval_secs(), 120);
+    }
+
+    #[test]
+    fn sync_interval_parsing() {
+        assert_eq!(super::parse_duration_secs("45s"), Some(45));
+        assert_eq!(super::parse_duration_secs("2m"), Some(120));
+        assert_eq!(super::parse_duration_secs("1h"), Some(3600));
+        assert_eq!(super::parse_duration_secs("90"), Some(90)); // bare int = seconds
+        // unparseable values are rejected, not silently coerced
+        assert_eq!(super::parse_duration_secs("1.5m"), None);
+        assert_eq!(super::parse_duration_secs("soon"), None);
+        assert_eq!(super::parse_duration_secs("s"), None);
     }
 }

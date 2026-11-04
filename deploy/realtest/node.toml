@@ -1,0 +1,19 @@
+# Manual-mode node config for the real-tailnet test. Paths are under a per-host
+# work dir; the deploy script substitutes WORK and COORD. triage_cmd re-runs a
+# crash through the ASAN build to capture the trace that drives the stack hash.
+
+[node]
+coordinator = "COORD:7100"
+priority = "shared"
+
+[fuzzer]
+name = "aflpp"
+command = ["afl-fuzz", "-i", "WORK/seeds", "-o", "WORK/out", "-M", "main", "-F", "WORK/inject", "-m", "none", "-t", "2000+", "--", "WORK/harness"]
+corpus_dir = "WORK/out/main/queue"
+crash_dir = "WORK/out/main/crashes"
+stats_file = "WORK/out/main/fuzzer_stats"
+triage_cmd = ["env", "ASAN_OPTIONS=symbolize=1:detect_leaks=0", "WORK/harness_asan", "{file}"]
+
+[circle]
+sync_interval = "10s"
+inject_dir = "WORK/inject"

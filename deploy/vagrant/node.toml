@@ -1,0 +1,26 @@
+# Manual-mode node config for the weird node (myc-arch).
+#
+# This is the corrected distributed recipe: mycelium watches the AFL++ instance
+# queue/crashes under -o (corpus_dir / crash_dir) and injects pulled peer seeds
+# into the -F foreign-corpus dir (inject_dir), NOT into the -i seed dir.
+#
+# Replace COORD with the coordinator's address on the private network
+# (myc-ubuntu1's 192.168.121.x). The smoke-test steps in README.md generate the
+# live copy at /opt/fuzz/node.toml with COORD already filled in.
+
+[node]
+coordinator = "COORD:7100"
+priority = "shared"
+
+[fuzzer]
+name = "aflpp"
+command = ["afl-fuzz", "-i", "/opt/fuzz/seeds", "-o", "/opt/fuzz/out", "-M", "main", "-F", "/opt/fuzz/inject", "-m", "none", "-t", "1000+", "--", "/opt/fuzz/harness"]
+corpus_dir = "/opt/fuzz/out/main/queue"
+crash_dir = "/opt/fuzz/out/main/crashes"
+stats_file = "/opt/fuzz/out/main/fuzzer_stats"
+
+[circle]
+sync_interval = "10s"
+inject_dir = "/opt/fuzz/inject"
+stats_parser = "aflpp"
+mode = "persistent"

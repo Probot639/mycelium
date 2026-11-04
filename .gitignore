@@ -1,1 +1,4 @@
 /target
+
+# Claude-authored working notes (reviews, improvement lists) - not for the committed tree
+.local/

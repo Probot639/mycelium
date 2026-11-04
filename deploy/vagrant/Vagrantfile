@@ -1,0 +1,49 @@
+# Multi-node test bed for the mycelium distributed fuzzer.
+#
+# Three libvirt VMs on the vagrant-libvirt network (192.168.121.0/24), each with
+# a static address so the coordinator sits at a known IP:
+#
+#   myc-ubuntu1  generic/ubuntu2204  192.168.121.10  coordinator + distributed node
+#   myc-ubuntu2  generic/ubuntu2204  192.168.121.11  distributed node
+#   myc-arch     generic/arch        192.168.121.12  manual-mode node (the weird node)
+#
+# The libvirt settings here mirror a known-working config on this host
+# (binex-vulnchat): an explicit management network, host-passthrough CPU, and a
+# static private_network per VM. The one host-level prerequisite is that the
+# vagrant-libvirt network's DHCP range starts at .2, not .1 (the .1 is the
+# gateway). generic/ubuntu2404 is not in the registry, so the second Ubuntu uses
+# 2204 as well, which also means the two Ubuntus can share one harness binary.
+
+NODES = {
+  "myc-ubuntu1" => { box: "generic/ubuntu2204", ip: "192.168.121.10", pkgs: "provision/packages-ubuntu.sh" },
+  "myc-ubuntu2" => { box: "generic/ubuntu2204", ip: "192.168.121.11", pkgs: "provision/packages-ubuntu.sh" },
+  "myc-arch"    => { box: "generic/arch",        ip: "192.168.121.12", pkgs: "provision/packages-arch.sh" },
+}
+
+Vagrant.configure("2") do |config|
+  # Copy the host repo into each guest without the huge target/ tree.
+  config.vm.synced_folder "../../", "/vagrant", type: "rsync",
+    rsync__exclude: ["target/", ".git/", ".local/", "deploy/vagrant/.vagrant/"]
+
+  NODES.each do |name, spec|
+    config.vm.define name do |node|
+      node.vm.box = spec[:box]
+      node.vm.hostname = name
+      node.vm.network "private_network", ip: spec[:ip]
+
+      node.vm.provider :libvirt do |lv|
+        lv.memory = 2048
+        lv.cpus = 2
+        lv.cpu_mode = "host-passthrough"
+        # domain name is just the machine name, no extra prefix
+        lv.default_prefix = ""
+        # pin the management NIC to the vagrant-libvirt network so DHCP is served
+        lv.management_network_name = "vagrant-libvirt"
+        lv.management_network_address = "192.168.121.0/24"
+      end
+
+      node.vm.provision "shell", path: spec[:pkgs]
+      node.vm.provision "shell", path: "provision/build.sh"
+    end
+  end
+end

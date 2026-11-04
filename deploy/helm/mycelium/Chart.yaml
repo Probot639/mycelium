@@ -1,0 +1,16 @@
+apiVersion: v2
+name: mycelium
+description: Distributed fuzzing orchestrator. One coordinator keeps the corpus in sync across N fuzzing nodes.
+type: application
+version: 0.1.0
+# The mycelium binary has no release tags yet, so track the repo state.
+appVersion: "0.1.0"
+keywords:
+  - fuzzing
+  - aflpp
+  - security
+home: https://github.com/odessa/mycelium
+sources:
+  - https://github.com/odessa/mycelium
+maintainers:
+  - name: odessa
