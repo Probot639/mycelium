@@ -73,13 +73,12 @@ mycelium probe --coordinator sigil:7100 --nodes
 
 ```
 Campaign: fuzz-libpng
-  corpus: 1423  crashes: 7  nodes: 4
+  corpus: 1423  crashes: 7  nodes: 3
 
 NODE             HOST         FUZZER       PRIORITY   STATUS       LAST SYNC
 sigil-a1f2       sigil        aflpp        dedicated  online       14:32:07
 songbird-b3e4    songbird     aflpp        shared     online       14:32:05
-glyph-c5d6       glyph        aflpp        shared     online       14:31:58
-tarot-d7e8       tarot        aflpp        idle       online       14:32:01
+glyph1-c5d6      glyph-1      aflpp        shared     online       14:31:58
 ```
 
 For machine-readable output (useful for automation):
@@ -88,7 +87,17 @@ For machine-readable output (useful for automation):
 mycelium probe --coordinator sigil:7100 --json
 ```
 
-Detach a node:
+### Fleet connectivity
+
+Check that all nodes are reachable before starting a campaign:
+
+```
+mycelium ping sigil songbird glyph-1
+```
+
+Probes port 22 (SSH) on each host, prints round-trip times, retries every 3 seconds until all respond. Use `--port` for a different port (e.g. `--port 7100` to check the coordinator).
+
+### Detaching nodes
 
 ```
 mycelium sever --coordinator sigil:7100 --node-id sigil-a1f2 --drain
