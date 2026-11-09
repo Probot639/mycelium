@@ -5,39 +5,55 @@ use anyhow::Result;
 
 use mycelium_common::corpus::{CrashEntry, Seed};
 use mycelium_common::node::{NodeInfo, NodeStatus};
-use mycelium_common::protocol::{CampaignInfo, CampaignStatus};
+use mycelium_common::protocol::{
+    CampaignInfo, CampaignLifecycle, CampaignStatus, MetricsSnapshot,
+};
 
-use crate::db::Db;
+use crate::storage::Storage;
 
 pub struct CoordinatorState {
-    pub db: Mutex<Db>,
+    db: Mutex<Box<dyn Storage>>,
     pub corpus_dir: PathBuf,
-    // Shared bearer token required on the write and harness endpoints. None
-    // leaves the coordinator open, which is only safe on a trusted network.
     pub auth_token: Option<String>,
 }
 
-impl CoordinatorState {
-    pub fn new(db_path: &Path, corpus_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(corpus_dir)?;
-        std::fs::create_dir_all(corpus_dir.join("blobs"))?;
-        std::fs::create_dir_all(corpus_dir.join("crashes"))?;
-        std::fs::create_dir_all(corpus_dir.join("harnesses"))?;
+fn init_corpus_dirs(corpus_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(corpus_dir)?;
+    std::fs::create_dir_all(corpus_dir.join("blobs"))?;
+    std::fs::create_dir_all(corpus_dir.join("crashes"))?;
+    std::fs::create_dir_all(corpus_dir.join("harnesses"))?;
+    Ok(())
+}
 
+impl CoordinatorState {
+    #[cfg(feature = "sqlite")]
+    pub fn new(db_path: &Path, corpus_dir: &Path) -> Result<Self> {
+        init_corpus_dirs(corpus_dir)?;
         Ok(Self {
-            db: Mutex::new(Db::open(db_path)?),
+            db: Mutex::new(Box::new(crate::db::Db::open(db_path)?)),
             corpus_dir: corpus_dir.to_path_buf(),
             auth_token: None,
         })
     }
 
+    #[cfg(feature = "sqlite")]
     pub fn new_in_memory(corpus_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(corpus_dir)?;
-        std::fs::create_dir_all(corpus_dir.join("blobs"))?;
-        std::fs::create_dir_all(corpus_dir.join("crashes"))?;
-        std::fs::create_dir_all(corpus_dir.join("harnesses"))?;
+        init_corpus_dirs(corpus_dir)?;
         Ok(Self {
-            db: Mutex::new(Db::open_in_memory()?),
+            db: Mutex::new(Box::new(crate::db::Db::open_in_memory()?)),
+            corpus_dir: corpus_dir.to_path_buf(),
+            auth_token: None,
+        })
+    }
+
+    #[cfg(feature = "postgres")]
+    pub fn new_pg(pool: sqlx::PgPool, corpus_dir: &Path) -> Result<Self> {
+        init_corpus_dirs(corpus_dir)?;
+        let pg = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::pg::PgDb::connect_with_pool(pool))
+        })?;
+        Ok(Self {
+            db: Mutex::new(Box::new(pg)),
             corpus_dir: corpus_dir.to_path_buf(),
             auth_token: None,
         })
@@ -77,9 +93,6 @@ impl CoordinatorState {
         let is_new = db.store_seed(seed)?;
         if is_new {
             let blob_path = self.corpus_dir.join("blobs").join(&seed.hash);
-            // If the blob write fails after the row committed, drop the row so a
-            // retry re-stores and re-writes both, instead of a permanent row with
-            // no blob on disk.
             if let Err(e) = std::fs::write(&blob_path, &seed.data) {
                 let _ = db.delete_seed(&seed.hash, &seed.campaign);
                 return Err(e.into());
@@ -95,6 +108,11 @@ impl CoordinatorState {
 
     pub fn get_seeds_for_node(&self, node_id: &str, campaign: &str) -> Result<Vec<Seed>> {
         let db = self.db.lock().unwrap();
+        if let Ok(Some(info)) = db.get_campaign(campaign) {
+            if matches!(info.lifecycle, CampaignLifecycle::Paused | CampaignLifecycle::Completed) {
+                return Ok(vec![]);
+            }
+        }
         let seeds = db.get_unseen_seeds(node_id, campaign)?;
         for seed in &seeds {
             db.mark_seed_sent(&seed.hash, node_id)?;
@@ -111,11 +129,6 @@ impl CoordinatorState {
         let db = self.db.lock().unwrap();
         let is_new = db.store_crash(crash)?;
         if is_new {
-            // one dir per bug (stack_hash), one reproducer per input (input_hash)
-            // inside it, so distinct inputs for the same bug all survive on disk.
-            // If any part of the on-disk write fails after the row committed, drop
-            // the row so a retry re-does the whole thing, rather than leaving a
-            // crash the DB counts but has no (or partial) reproducer for.
             let write = || -> std::io::Result<()> {
                 let crash_dir = self.corpus_dir.join("crashes").join(&crash.stack_hash);
                 std::fs::create_dir_all(&crash_dir)?;
@@ -140,9 +153,10 @@ impl CoordinatorState {
         execs_per_sec: u64,
         corpus_size: u64,
         crashes_found: u64,
+        edges_found: u64,
     ) -> Result<()> {
         let db = self.db.lock().unwrap();
-        db.update_heartbeat(node_id, execs_per_sec, corpus_size, crashes_found)
+        db.update_heartbeat(node_id, execs_per_sec, corpus_size, crashes_found, edges_found)
     }
 
     pub fn list_nodes(&self, campaign: Option<&str>) -> Result<Vec<NodeInfo>> {
@@ -153,16 +167,21 @@ impl CoordinatorState {
     pub fn campaign_status(&self, campaign: &str) -> Result<CampaignStatus> {
         let db = self.db.lock().unwrap();
         let nodes = db.list_nodes(Some(campaign))?;
+        let lifecycle = db
+            .get_campaign_lifecycle(campaign)?
+            .unwrap_or(CampaignLifecycle::Running);
         Ok(CampaignStatus {
             name: campaign.to_string(),
             total_corpus: db.count_seeds(campaign)?,
             total_crashes: db.count_crashes(campaign)?,
             unique_bugs: db.count_unique_bugs(campaign)?,
             total_execs_per_sec: db.sum_execs_per_sec(campaign)?,
+            total_edges: db.sum_edges(campaign)?,
             nodes_online: nodes
                 .iter()
                 .filter(|n| n.status == NodeStatus::Online)
                 .count() as u64,
+            lifecycle,
         })
     }
 
@@ -171,14 +190,24 @@ impl CoordinatorState {
         name: &str,
         fuzzer_name: &str,
         fuzzer_command: &[String],
+        triage_cmd: Option<&[String]>,
     ) -> Result<()> {
         let db = self.db.lock().unwrap();
-        db.create_campaign(name, fuzzer_name, fuzzer_command)
+        db.create_campaign(name, fuzzer_name, fuzzer_command, triage_cmd)
     }
 
     pub fn get_campaign(&self, name: &str) -> Result<Option<CampaignInfo>> {
         let db = self.db.lock().unwrap();
         db.get_campaign(name)
+    }
+
+    pub fn update_campaign_lifecycle(
+        &self,
+        name: &str,
+        lifecycle: CampaignLifecycle,
+    ) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        db.update_campaign_lifecycle(name, lifecycle)
     }
 
     pub fn store_harness(&self, campaign: &str, data: &[u8]) -> Result<()> {
@@ -209,5 +238,34 @@ impl CoordinatorState {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn snapshot_metrics(&self) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        for name in db.list_campaign_names()? {
+            if let Err(e) = db.snapshot_metrics(&name) {
+                tracing::warn!(campaign = %name, error = %e, "metrics snapshot failed");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_metrics(&self, campaign: &str, limit: u64) -> Result<Vec<MetricsSnapshot>> {
+        let db = self.db.lock().unwrap();
+        db.get_metrics(campaign, limit)
+    }
+
+    pub fn list_seed_hashes(&self, campaign: &str) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        db.list_seed_hashes(campaign)
+    }
+
+    pub fn list_crashes(
+        &self,
+        campaign: &str,
+        limit: u64,
+    ) -> Result<Vec<CrashEntry>> {
+        let db = self.db.lock().unwrap();
+        db.list_crashes(campaign, limit)
     }
 }

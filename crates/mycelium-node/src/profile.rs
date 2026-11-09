@@ -36,6 +36,11 @@ pub struct FuzzerProfile {
     pub writes_corpus_to_output: bool,
     /// Default stats parser name (see `mycelium_common::stats::parse_stats`).
     pub stats_parser: String,
+    /// Command template for collecting coverage from a corpus entry. `{harness}`
+    /// is the instrumented binary, `{file}` the input. The command should produce
+    /// profraw/gcda/sancov output that the observer or a CI step can merge.
+    /// None means no per-input coverage collection is configured.
+    pub coverage_cmd: Option<Vec<String>>,
 }
 
 impl FuzzerProfile {
@@ -71,6 +76,10 @@ impl FuzzerProfile {
             afl_instance_layout: true,
             writes_corpus_to_output: false,
             stats_parser: "aflpp".into(),
+            coverage_cmd: Some(vec![
+                "afl-showmap".into(), "-o".into(), "/dev/null".into(),
+                "-C".into(), "--".into(), "{harness}".into(), "{file}".into(),
+            ]),
         }
     }
 
@@ -89,6 +98,7 @@ impl FuzzerProfile {
             afl_instance_layout: false,
             writes_corpus_to_output: false,
             stats_parser: "libfuzzer".into(),
+            coverage_cmd: Some(vec!["{harness}".into(), "{file}".into()]),
         }
     }
 
@@ -101,6 +111,7 @@ impl FuzzerProfile {
             afl_instance_layout: false,
             writes_corpus_to_output: true,
             stats_parser: "honggfuzz".into(),
+            coverage_cmd: None,
         }
     }
 
@@ -113,6 +124,7 @@ impl FuzzerProfile {
             afl_instance_layout: false,
             writes_corpus_to_output: true,
             stats_parser: "aflpp".into(),
+            coverage_cmd: None,
         }
     }
 
@@ -125,6 +137,7 @@ impl FuzzerProfile {
             afl_instance_layout: false,
             writes_corpus_to_output: true,
             stats_parser: "aflpp".into(),
+            coverage_cmd: None,
         }
     }
 
@@ -142,6 +155,7 @@ impl FuzzerProfile {
             afl_instance_layout: false,
             writes_corpus_to_output: true,
             stats_parser: "aflpp".into(),
+            coverage_cmd: None,
         }
     }
 

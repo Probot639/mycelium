@@ -39,6 +39,12 @@ enum Commands {
         /// corpus so joining nodes begin from real inputs, not an empty corpus.
         #[arg(long)]
         seeds: Option<PathBuf>,
+        /// Triage command template for crash dedup. Runs on crashing inputs to
+        /// capture sanitizer output for per-bug stack hashing. Use {file} for
+        /// the crash input path. Defaults to "{harness} {file}" for libfuzzer
+        /// fuzzers, empty for others (dedup by input hash only).
+        #[arg(long, value_delimiter = ' ', num_args = 1..)]
+        triage_cmd: Option<Vec<String>>,
         /// Fuzzer command template. Use {harness}, {corpus}, {output}, {inject}
         /// as placeholders. For AFL++ distributed mode the command must run a
         /// main instance and import the injected foreign corpus, e.g.
@@ -85,6 +91,28 @@ enum Commands {
         #[arg(long)]
         drain: bool,
     },
+
+    /// Set a campaign's lifecycle state (running, paused, draining, completed)
+    Lifecycle {
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long)]
+        campaign: String,
+        /// Target state
+        state: String,
+    },
+
+    /// Query historical metrics snapshots for a campaign
+    Metrics {
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long)]
+        campaign: String,
+        #[arg(long, default_value = "50")]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -109,6 +137,7 @@ async fn main() -> Result<()> {
             harness,
             fuzzer,
             seeds,
+            triage_cmd,
             cmd,
         } => {
             let harness_data = std::fs::read(&harness)?;
@@ -119,11 +148,26 @@ async fn main() -> Result<()> {
                 "creating campaign"
             );
 
+            // Auto-derive triage command for libfuzzer-family fuzzers when none
+            // is given. The harness binary re-runs a crashing input when passed
+            // it as an argument, so "{harness} {file}" captures the sanitizer
+            // trace for per-bug stack hashing on distributed nodes.
+            let effective_triage: Option<Vec<String>> = triage_cmd.or_else(|| {
+                let profile = mycelium_node::profile::FuzzerProfile::builtin(&fuzzer);
+                match profile.as_ref().map(|p| p.name.as_str()) {
+                    Some("libfuzzer" | "cargo-fuzz" | "cargofuzz" | "atheris" | "jazzer") => {
+                        Some(vec!["{harness}".into(), "{file}".into()])
+                    }
+                    _ => None,
+                }
+            });
+
             mycelium_node::sync::SyncClient::create_campaign(
                 &coordinator,
                 &campaign,
                 &fuzzer,
                 &cmd,
+                effective_triage.as_deref(),
             )
             .await?;
 
@@ -304,6 +348,15 @@ async fn main() -> Result<()> {
                         )
                     };
 
+                    // Pull the campaign's triage command and substitute
+                    // {harness} so the node can auto-triage crashes for
+                    // per-bug dedup instead of falling back to per-input hash.
+                    let dist_triage: Option<Vec<String>> = camp_info.triage_cmd.map(|cmd| {
+                        cmd.iter()
+                            .map(|a| a.replace("{harness}", &harness_path.to_string_lossy()))
+                            .collect()
+                    });
+
                     run_fuzzer_loop(RunParams {
                         coordinator: &coordinator,
                         node_id: &node_id,
@@ -319,7 +372,7 @@ async fn main() -> Result<()> {
                         inject_dir: &live_inject,
                         import_cmd: None,
                         stats_cmd: None,
-                        triage_cmd: None,
+                        triage_cmd: dist_triage,
                         sync_interval_secs: 30,
                     })
                     .await?;
@@ -353,6 +406,8 @@ async fn main() -> Result<()> {
                     let stats_parser = cfg.stats_parser();
                     let profile = cfg.profile();
 
+                    // Manual-config triage command is already local paths, no
+                    // {harness} substitution needed.
                     run_fuzzer_loop(RunParams {
                         coordinator: &coordinator,
                         node_id: &node_id,
@@ -367,8 +422,6 @@ async fn main() -> Result<()> {
                             crash_dir: PathBuf::from(&cfg.fuzzer.crash_dir),
                             stats_file,
                         },
-                        // manual config drives the fuzzer's own streams and stats
-                        // file, so do not tee its output
                         fuzzer_log: None,
                         initial_seed_dir: &inject_dir,
                         inject_dir: &inject_dir,
@@ -404,12 +457,13 @@ async fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&resp)?);
             } else {
-                println!("Campaign: {}", resp.campaign.name);
+                println!("Campaign: {}  [{}]", resp.campaign.name, resp.campaign.lifecycle);
                 println!(
-                    "  corpus: {}  crashes: {} ({} bugs)  nodes: {}",
+                    "  corpus: {}  crashes: {} ({} bugs)  edges: {}  nodes: {}",
                     resp.campaign.total_corpus,
                     resp.campaign.total_crashes,
                     resp.campaign.unique_bugs,
+                    resp.campaign.total_edges,
                     resp.campaign.nodes_online
                 );
 
@@ -446,6 +500,81 @@ async fn main() -> Result<()> {
             let sync = mycelium_node::sync::SyncClient::new(&coordinator, &node_id, "");
             sync.deregister(drain).await?;
             tracing::info!(%node_id, drain, "severed");
+        }
+
+        Commands::Lifecycle {
+            coordinator,
+            campaign,
+            state,
+        } => {
+            let lifecycle: mycelium_common::protocol::CampaignLifecycle =
+                serde_json::from_str(&format!("\"{state}\""))
+                    .map_err(|_| anyhow::anyhow!(
+                        "invalid lifecycle state '{state}': must be running, paused, draining, or completed"
+                    ))?;
+            let base = if coordinator.starts_with("http") {
+                coordinator
+            } else {
+                format!("http://{coordinator}")
+            };
+            let client = reqwest::Client::builder().build()?;
+            let mut req = client.patch(format!("{base}/api/v1/campaign/{campaign}/lifecycle"));
+            if let Some(token) = std::env::var("MYCELIUM_TOKEN").ok().filter(|s| !s.is_empty()) {
+                req = req.bearer_auth(token);
+            }
+            req.json(&mycelium_common::protocol::UpdateCampaignLifecycleRequest { lifecycle })
+                .send()
+                .await?
+                .error_for_status()?;
+            tracing::info!(%campaign, %state, "lifecycle updated");
+        }
+
+        Commands::Metrics {
+            coordinator,
+            campaign,
+            limit,
+            json,
+        } => {
+            let base = if coordinator.starts_with("http") {
+                coordinator
+            } else {
+                format!("http://{coordinator}")
+            };
+            let resp: mycelium_common::protocol::MetricsResponse =
+                reqwest::get(format!("{base}/api/v1/metrics/{campaign}?limit={limit}"))
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+
+            if json {
+                println!("{}", serde_json::to_string(&resp)?);
+            } else {
+                println!("Metrics: {} ({} snapshots)", resp.campaign, resp.snapshots.len());
+                if resp.snapshots.is_empty() {
+                    println!("  (no snapshots yet)");
+                } else {
+                    println!(
+                        "{:>12} {:>10} {:>8} {:>8} {:>8} {:>8} {:>6}",
+                        "TIMESTAMP", "EXEC/S", "CORPUS", "CRASHES", "BUGS", "EDGES", "NODES"
+                    );
+                    for s in &resp.snapshots {
+                        let ts = chrono::DateTime::from_timestamp(s.ts, 0)
+                            .map(|d| d.format("%H:%M:%S").to_string())
+                            .unwrap_or_else(|| s.ts.to_string());
+                        println!(
+                            "{:>12} {:>10} {:>8} {:>8} {:>8} {:>8} {:>6}",
+                            ts,
+                            s.total_execs_per_sec,
+                            s.corpus_size,
+                            s.crashes,
+                            s.unique_bugs,
+                            s.edges,
+                            s.nodes_online,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -716,7 +845,7 @@ async fn run_fuzzer_loop(p: RunParams<'_>) -> Result<()> {
                 })
                 .await
                 .unwrap_or_default();
-                if let Err(e) = sync.heartbeat(stats.execs_per_sec, stats.corpus_size, stats.crashes_found).await {
+                if let Err(e) = sync.heartbeat(stats.execs_per_sec, stats.corpus_size, stats.crashes_found, stats.edges_found).await {
                     tracing::warn!(error = %e, "heartbeat failed");
                 }
             }
@@ -790,7 +919,7 @@ async fn run_fuzzer_loop(p: RunParams<'_>) -> Result<()> {
         .await
         .unwrap_or_default();
         if let Err(e) = sync
-            .heartbeat(stats.execs_per_sec, stats.corpus_size, stats.crashes_found)
+            .heartbeat(stats.execs_per_sec, stats.corpus_size, stats.crashes_found, stats.edges_found)
             .await
         {
             tracing::warn!(error = %e, "final heartbeat failed");

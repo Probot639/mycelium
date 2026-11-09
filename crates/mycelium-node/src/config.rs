@@ -47,6 +47,11 @@ pub struct FuzzerConfig {
     /// deduped per input.
     #[serde(default)]
     pub triage_cmd: Option<Vec<String>>,
+    /// Command template for collecting per-input coverage. `{harness}` is
+    /// replaced with the instrumented binary, `{file}` with the input path.
+    /// Defaults to the profile's built-in if unset.
+    #[serde(default)]
+    pub coverage_cmd: Option<Vec<String>>,
     /// Script hooks for a custom fuzzer that file layout alone cannot drive.
     #[serde(default)]
     pub hooks: Hooks,
@@ -136,7 +141,11 @@ impl CircleConfig {
     /// tells seeds from crashes from bookkeeping. Unknown names fall back to the
     /// AFL++ layout.
     pub fn profile(&self) -> FuzzerProfile {
-        FuzzerProfile::builtin(&self.fuzzer.name).unwrap_or_else(FuzzerProfile::aflpp)
+        let mut p = FuzzerProfile::builtin(&self.fuzzer.name).unwrap_or_else(FuzzerProfile::aflpp);
+        if let Some(ref cmd) = self.fuzzer.coverage_cmd {
+            p.coverage_cmd = Some(cmd.clone());
+        }
+        p
     }
 
     /// Which stats parser to use for heartbeat reporting: the explicit config

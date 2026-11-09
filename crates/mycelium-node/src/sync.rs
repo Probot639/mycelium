@@ -184,7 +184,13 @@ impl SyncClient {
         Ok(())
     }
 
-    pub async fn heartbeat(&self, execs_per_sec: u64, corpus_size: u64, crashes_found: u64) -> Result<()> {
+    pub async fn heartbeat(
+        &self,
+        execs_per_sec: u64,
+        corpus_size: u64,
+        crashes_found: u64,
+        edges_found: u64,
+    ) -> Result<()> {
         self.client
             .post(format!("{}/heartbeat", self.coordinator_url))
             .json(&HeartbeatRequest {
@@ -192,6 +198,7 @@ impl SyncClient {
                 execs_per_sec,
                 corpus_size,
                 crashes_found,
+                edges_found,
             })
             .send()
             .await?
@@ -234,6 +241,7 @@ impl SyncClient {
         name: &str,
         fuzzer_name: &str,
         fuzzer_command: &[String],
+        triage_cmd: Option<&[String]>,
     ) -> Result<()> {
         let base = if coordinator_url.starts_with("http") {
             coordinator_url.to_string()
@@ -246,6 +254,7 @@ impl SyncClient {
                 name: name.into(),
                 fuzzer_name: fuzzer_name.into(),
                 fuzzer_command: fuzzer_command.to_vec(),
+                triage_cmd: triage_cmd.map(|c| c.to_vec()),
             })
             .send()
             .await?

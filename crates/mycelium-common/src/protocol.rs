@@ -3,6 +3,27 @@ use serde::{Deserialize, Serialize};
 use crate::corpus::{CrashEntry, Seed};
 use crate::node::{NodeInfo, Priority};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CampaignLifecycle {
+    #[default]
+    Running,
+    Paused,
+    Draining,
+    Completed,
+}
+
+impl std::fmt::Display for CampaignLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CampaignLifecycle::Running => write!(f, "running"),
+            CampaignLifecycle::Paused => write!(f, "paused"),
+            CampaignLifecycle::Draining => write!(f, "draining"),
+            CampaignLifecycle::Completed => write!(f, "completed"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub hostname: String,
@@ -62,6 +83,8 @@ pub struct HeartbeatRequest {
     pub execs_per_sec: u64,
     pub corpus_size: u64,
     pub crashes_found: u64,
+    #[serde(default)]
+    pub edges_found: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,7 +102,11 @@ pub struct CampaignStatus {
     #[serde(default)]
     pub unique_bugs: u64,
     pub total_execs_per_sec: u64,
+    #[serde(default)]
+    pub total_edges: u64,
     pub nodes_online: u64,
+    #[serde(default)]
+    pub lifecycle: CampaignLifecycle,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +120,8 @@ pub struct CreateCampaignRequest {
     pub name: String,
     pub fuzzer_name: String,
     pub fuzzer_command: Vec<String>,
+    #[serde(default)]
+    pub triage_cmd: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +129,56 @@ pub struct CampaignInfo {
     pub name: String,
     pub fuzzer_name: String,
     pub fuzzer_command: Vec<String>,
+    #[serde(default)]
+    pub triage_cmd: Option<Vec<String>>,
     pub harness_len: u64,
     pub created_at: i64,
+    #[serde(default)]
+    pub lifecycle: CampaignLifecycle,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateCampaignLifecycleRequest {
+    pub lifecycle: CampaignLifecycle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub ts: i64,
+    pub total_execs_per_sec: u64,
+    pub corpus_size: u64,
+    pub crashes: u64,
+    pub unique_bugs: u64,
+    pub edges: u64,
+    pub nodes_online: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MetricsResponse {
+    pub campaign: String,
+    pub snapshots: Vec<MetricsSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CorpusListResponse {
+    pub campaign: String,
+    pub hashes: Vec<String>,
+    pub total: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InjectSeedsRequest {
+    pub seeds: Vec<Seed>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PullCrashesRequest {
+    pub campaign: String,
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PullCrashesResponse {
+    pub crashes: Vec<CrashEntry>,
 }

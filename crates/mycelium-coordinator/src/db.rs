@@ -5,6 +5,7 @@ use rusqlite::Connection;
 
 use mycelium_common::corpus::{CrashEntry, Seed};
 use mycelium_common::node::{NodeInfo, NodeStatus, Priority};
+use mycelium_common::protocol::{CampaignLifecycle, MetricsSnapshot};
 
 pub struct Db {
     conn: Connection,
@@ -38,7 +39,8 @@ impl Db {
                 execs_per_sec INTEGER NOT NULL DEFAULT 0,
                 corpus_size INTEGER NOT NULL DEFAULT 0,
                 crashes_found INTEGER NOT NULL DEFAULT 0,
-                time_limited INTEGER NOT NULL DEFAULT 0
+                time_limited INTEGER NOT NULL DEFAULT 0,
+                edges_found INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS seeds (
@@ -72,15 +74,29 @@ impl Db {
                 fuzzer_name TEXT NOT NULL,
                 fuzzer_command TEXT NOT NULL,
                 harness_len INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                triage_cmd TEXT,
+                lifecycle TEXT NOT NULL DEFAULT 'running'
+            );
+
+            CREATE TABLE IF NOT EXISTS metrics (
+                campaign TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                total_execs_per_sec INTEGER NOT NULL DEFAULT 0,
+                corpus_size INTEGER NOT NULL DEFAULT 0,
+                crashes INTEGER NOT NULL DEFAULT 0,
+                unique_bugs INTEGER NOT NULL DEFAULT 0,
+                edges INTEGER NOT NULL DEFAULT 0,
+                nodes_online INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (campaign, ts)
             );",
         )?;
-        // Add columns introduced after the first schema. A DB created by an
-        // older coordinator will not have them, and ADD COLUMN errors if the
-        // column already exists, so ignore that one case.
-        let _ = self
-            .conn
-            .execute("ALTER TABLE nodes ADD COLUMN time_limited INTEGER NOT NULL DEFAULT 0", []);
+        // Add columns introduced after the first schema. ADD COLUMN errors if
+        // the column already exists, so ignore that one case.
+        let _ = self.conn.execute("ALTER TABLE nodes ADD COLUMN time_limited INTEGER NOT NULL DEFAULT 0", []);
+        let _ = self.conn.execute("ALTER TABLE nodes ADD COLUMN edges_found INTEGER NOT NULL DEFAULT 0", []);
+        let _ = self.conn.execute("ALTER TABLE campaigns ADD COLUMN triage_cmd TEXT", []);
+        let _ = self.conn.execute("ALTER TABLE campaigns ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'running'", []);
         Ok(())
     }
 
@@ -150,19 +166,16 @@ impl Db {
         execs_per_sec: u64,
         corpus_size: u64,
         crashes_found: u64,
+        edges_found: u64,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        // SQLite integers are signed, and rusqlite refuses a u64 past i64::MAX.
-        // Clamp so a bogus or overflowing node value cannot 500 the heartbeat.
         let clamp = |v: u64| v.min(i64::MAX as u64) as i64;
-        // A suspended (drained) node that is still alive keeps heartbeating; do
-        // not flip it back to online, or a hand-drain never sticks while the
-        // process runs. Any other status advances to online on a heartbeat.
         self.conn.execute(
             "UPDATE nodes SET last_sync = ?1, execs_per_sec = ?2, corpus_size = ?3, crashes_found = ?4,
+                edges_found = ?5,
                 status = CASE WHEN status = 'suspended' THEN 'suspended' ELSE 'online' END
-             WHERE id = ?5",
-            (now, clamp(execs_per_sec), clamp(corpus_size), clamp(crashes_found), node_id),
+             WHERE id = ?6",
+            (now, clamp(execs_per_sec), clamp(corpus_size), clamp(crashes_found), clamp(edges_found), node_id),
         )?;
         Ok(())
     }
@@ -359,30 +372,37 @@ impl Db {
         name: &str,
         fuzzer_name: &str,
         fuzzer_command: &[String],
+        triage_cmd: Option<&[String]>,
     ) -> Result<()> {
         let cmd_json = serde_json::to_string(fuzzer_command)?;
+        let triage_json = triage_cmd.map(|c| serde_json::to_string(c)).transpose()?;
         let now = chrono::Utc::now().timestamp();
         self.conn.execute(
-            "INSERT INTO campaigns (name, fuzzer_name, fuzzer_command, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            (name, fuzzer_name, &cmd_json, now),
+            "INSERT INTO campaigns (name, fuzzer_name, fuzzer_command, triage_cmd, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (name, fuzzer_name, &cmd_json, &triage_json, now),
         )?;
         Ok(())
     }
 
     pub fn get_campaign(&self, name: &str) -> Result<Option<mycelium_common::protocol::CampaignInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, fuzzer_name, fuzzer_command, harness_len, created_at FROM campaigns WHERE name = ?1",
+            "SELECT name, fuzzer_name, fuzzer_command, harness_len, created_at, triage_cmd, lifecycle FROM campaigns WHERE name = ?1",
         )?;
         let mut rows = stmt.query_map([name], |row| {
             let cmd_json: String = row.get(2)?;
             let harness_len: i64 = row.get(3)?;
+            let triage_json: Option<String> = row.get(5)?;
+            let lifecycle_str: String = row.get::<_, String>(6).unwrap_or_else(|_| "running".into());
             Ok(mycelium_common::protocol::CampaignInfo {
                 name: row.get(0)?,
                 fuzzer_name: row.get(1)?,
                 fuzzer_command: serde_json::from_str(&cmd_json).unwrap_or_default(),
+                triage_cmd: triage_json.and_then(|j| serde_json::from_str(&j).ok()),
                 harness_len: harness_len as u64,
                 created_at: row.get(4)?,
+                lifecycle: serde_json::from_str(&format!("\"{lifecycle_str}\""))
+                    .unwrap_or(CampaignLifecycle::Running),
             })
         })?;
         match rows.next() {
@@ -398,6 +418,173 @@ impl Db {
             (len as i64, campaign),
         )?;
         Ok(())
+    }
+
+    pub fn sum_edges(&self, campaign: &str) -> Result<u64> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(edges_found), 0) FROM nodes WHERE campaign = ?1 AND status = 'online'",
+            [campaign],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    pub fn update_campaign_lifecycle(&self, name: &str, lifecycle: CampaignLifecycle) -> Result<bool> {
+        let status_str = serde_json::to_string(&lifecycle)?;
+        let n = self.conn.execute(
+            "UPDATE campaigns SET lifecycle = ?1 WHERE name = ?2",
+            [status_str.trim_matches('"'), name],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn get_campaign_lifecycle(&self, name: &str) -> Result<Option<CampaignLifecycle>> {
+        match self.conn.query_row(
+            "SELECT lifecycle FROM campaigns WHERE name = ?1",
+            [name],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(s) => Ok(Some(
+                serde_json::from_str(&format!("\"{s}\"")).unwrap_or(CampaignLifecycle::Running),
+            )),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn snapshot_metrics(&self, campaign: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let corpus = self.count_seeds(campaign)? as i64;
+        let crashes = self.count_crashes(campaign)? as i64;
+        let bugs = self.count_unique_bugs(campaign)? as i64;
+        let execs: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(execs_per_sec), 0) FROM nodes WHERE campaign = ?1 AND status = 'online'",
+            [campaign],
+            |row| row.get(0),
+        )?;
+        let edges: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(edges_found), 0) FROM nodes WHERE campaign = ?1 AND status = 'online'",
+            [campaign],
+            |row| row.get(0),
+        )?;
+        let nodes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE campaign = ?1 AND status = 'online'",
+            [campaign],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO metrics (campaign, ts, total_execs_per_sec, corpus_size, crashes, unique_bugs, edges, nodes_online)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (campaign, now, execs, corpus, crashes, bugs, edges, nodes),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_metrics(&self, campaign: &str, limit: u64) -> Result<Vec<MetricsSnapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, total_execs_per_sec, corpus_size, crashes, unique_bugs, edges, nodes_online
+             FROM metrics WHERE campaign = ?1 ORDER BY ts DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![campaign, limit as i64], |row| {
+            Ok(MetricsSnapshot {
+                ts: row.get(0)?,
+                total_execs_per_sec: row.get::<_, i64>(1)? as u64,
+                corpus_size: row.get::<_, i64>(2)? as u64,
+                crashes: row.get::<_, i64>(3)? as u64,
+                unique_bugs: row.get::<_, i64>(4)? as u64,
+                edges: row.get::<_, i64>(5)? as u64,
+                nodes_online: row.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    pub fn list_seed_hashes(&self, campaign: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hash FROM seeds WHERE campaign = ?1 ORDER BY found_at",
+        )?;
+        let rows = stmt.query_map([campaign], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_crashes(&self, campaign: &str, limit: u64) -> Result<Vec<CrashEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT stack_hash, input_hash, data, sanitizer_output, source_node, campaign, found_at
+             FROM crashes WHERE campaign = ?1 ORDER BY found_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![campaign, limit as i64], |row| {
+            let ts: i64 = row.get(6)?;
+            Ok(CrashEntry {
+                stack_hash: row.get(0)?,
+                input_hash: row.get(1)?,
+                data: row.get(2)?,
+                sanitizer_output: row.get(3)?,
+                source_node: row.get(4)?,
+                campaign: row.get(5)?,
+                found_at: chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default(),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_campaign_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT name FROM campaigns ORDER BY created_at")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+}
+
+impl crate::storage::Storage for Db {
+    fn register_node(&self, info: &NodeInfo) -> Result<()> { self.register_node(info) }
+    fn deregister_node(&self, node_id: &str) -> Result<()> { self.deregister_node(node_id) }
+    fn update_node_status(&self, node_id: &str, status: NodeStatus) -> Result<()> { self.update_node_status(node_id, status) }
+    fn mark_stale_offline(&self, timeout_secs: i64) -> Result<usize> { self.mark_stale_offline(timeout_secs) }
+    fn store_seed(&self, seed: &Seed) -> Result<bool> { self.store_seed(seed) }
+    fn delete_seed(&self, hash: &str, campaign: &str) -> Result<()> { self.delete_seed(hash, campaign) }
+    fn node_campaign(&self, node_id: &str) -> Result<Option<String>> { self.node_campaign(node_id) }
+    fn get_campaign(&self, name: &str) -> Result<Option<mycelium_common::protocol::CampaignInfo>> { self.get_campaign(name) }
+    fn get_unseen_seeds(&self, node_id: &str, campaign: &str) -> Result<Vec<Seed>> { self.get_unseen_seeds(node_id, campaign) }
+    fn mark_seed_sent(&self, seed_hash: &str, node_id: &str) -> Result<()> { self.mark_seed_sent(seed_hash, node_id) }
+    fn store_crash(&self, crash: &CrashEntry) -> Result<bool> { self.store_crash(crash) }
+    fn delete_crash(&self, input_hash: &str, campaign: &str) -> Result<()> { self.delete_crash(input_hash, campaign) }
+    fn update_heartbeat(&self, node_id: &str, execs_per_sec: u64, corpus_size: u64, crashes_found: u64, edges_found: u64) -> Result<()> {
+        self.update_heartbeat(node_id, execs_per_sec, corpus_size, crashes_found, edges_found)
+    }
+    fn list_nodes(&self, campaign: Option<&str>) -> Result<Vec<NodeInfo>> { self.list_nodes(campaign) }
+    fn count_seeds(&self, campaign: &str) -> Result<u64> { self.count_seeds(campaign) }
+    fn count_crashes(&self, campaign: &str) -> Result<u64> { self.count_crashes(campaign) }
+    fn count_unique_bugs(&self, campaign: &str) -> Result<u64> { self.count_unique_bugs(campaign) }
+    fn sum_execs_per_sec(&self, campaign: &str) -> Result<u64> { self.sum_execs_per_sec(campaign) }
+    fn sum_edges(&self, campaign: &str) -> Result<u64> { self.sum_edges(campaign) }
+    fn get_campaign_lifecycle(&self, name: &str) -> Result<Option<CampaignLifecycle>> { self.get_campaign_lifecycle(name) }
+    fn create_campaign(&self, name: &str, fuzzer_name: &str, fuzzer_command: &[String], triage_cmd: Option<&[String]>) -> Result<()> {
+        self.create_campaign(name, fuzzer_name, fuzzer_command, triage_cmd)
+    }
+    fn set_harness_len(&self, campaign: &str, len: u64) -> Result<()> { self.set_harness_len(campaign, len) }
+    fn list_campaign_names(&self) -> Result<Vec<String>> { self.list_campaign_names() }
+    fn snapshot_metrics(&self, campaign: &str) -> Result<()> { self.snapshot_metrics(campaign) }
+    fn get_metrics(&self, campaign: &str, limit: u64) -> Result<Vec<MetricsSnapshot>> { self.get_metrics(campaign, limit) }
+    fn list_seed_hashes(&self, campaign: &str) -> Result<Vec<String>> { self.list_seed_hashes(campaign) }
+    fn list_crashes(&self, campaign: &str, limit: u64) -> Result<Vec<CrashEntry>> { self.list_crashes(campaign, limit) }
+    fn update_campaign_lifecycle(&self, name: &str, lifecycle: CampaignLifecycle) -> Result<bool> {
+        self.update_campaign_lifecycle(name, lifecycle)
     }
 }
 
@@ -449,7 +636,7 @@ mod tests {
     fn reregister_preserves_stats() {
         let db = test_db();
         db.register_node(&test_node("worker-7")).unwrap();
-        db.update_heartbeat("worker-7", 90_000, 5000, 42).unwrap();
+        db.update_heartbeat("worker-7", 90_000, 5000, 42, 0).unwrap();
         // a restart re-registers with the same id; stats must survive
         db.register_node(&test_node("worker-7")).unwrap();
         let n = db.sum_execs_per_sec("test-campaign").unwrap();
@@ -462,7 +649,7 @@ mod tests {
         db.register_node(&test_node("drained")).unwrap();
         db.update_node_status("drained", NodeStatus::Suspended).unwrap();
         // a still-running drained node keeps heartbeating; it must stay suspended
-        db.update_heartbeat("drained", 1000, 10, 0).unwrap();
+        db.update_heartbeat("drained", 1000, 10, 0, 0).unwrap();
         let nodes = db.list_nodes(None).unwrap();
         assert_eq!(nodes[0].status, NodeStatus::Suspended);
     }

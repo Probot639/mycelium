@@ -255,7 +255,7 @@ async fn heartbeat_and_scry() {
         .unwrap();
     let sync = SyncClient::new(&url, &node_id, "campaign-3");
 
-    sync.heartbeat(5000, 42, 0).await.unwrap();
+    sync.heartbeat(5000, 42, 0, 0).await.unwrap();
 
     let resp: mycelium_common::protocol::ScryResponse =
         reqwest::get(format!("{url}/scry")).await.unwrap().json().await.unwrap();
@@ -312,7 +312,7 @@ async fn heartbeat_clamps_huge_execs() {
         .unwrap();
     let sync = SyncClient::new(&url, &node_id, "campaign-hb");
     // u64::MAX exceeds i64::MAX; before the clamp this returned 500
-    sync.heartbeat(u64::MAX, 10, 0).await.unwrap();
+    sync.heartbeat(u64::MAX, 10, 0, 0).await.unwrap();
 
     let resp: mycelium_common::protocol::ScryResponse =
         reqwest::get(format!("{url}/scry")).await.unwrap().json().await.unwrap();
@@ -339,6 +339,7 @@ async fn campaign_create_and_harness_roundtrip() {
                 "--".into(),
                 "{harness}".into(),
             ],
+            triage_cmd: None,
         })
         .send()
         .await
@@ -447,6 +448,7 @@ async fn rejects_traversal_campaign_name() {
             name: "../../etc/cron.d/x".into(),
             fuzzer_name: "aflpp".into(),
             fuzzer_command: vec!["afl-fuzz".into()],
+            triage_cmd: None,
         })
         .send()
         .await
