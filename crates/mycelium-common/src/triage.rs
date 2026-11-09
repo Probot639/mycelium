@@ -4,12 +4,21 @@ use crate::corpus::hash_bytes;
 /// class plus the top stack frames, with volatile addresses and offsets dropped.
 /// Two crashing inputs that hit the same bug produce the same signature, so the
 /// coordinator can group them.
+///
+/// Also handles common non-sanitizer crash messages (glibc stack protector, heap
+/// corruption) so that QEMU-mode fuzzing without ASAN still gets useful dedup.
 pub fn stack_signature(output: &str) -> String {
     let mut kind = String::new();
+    let mut kind_is_sanitizer = false;
     let mut frames: Vec<String> = Vec::new();
 
     for line in output.lines() {
-        if kind.is_empty() {
+        // ASAN/libFuzzer markers always override a glibc/signal tag that
+        // appeared on an earlier line, because they carry a more specific
+        // error class. glibc's __stack_chk_fail prints "stack smashing
+        // detected" then calls abort(); ASAN's signal handler fires after
+        // that, so without this precedence the less-informative tag sticks.
+        if !kind_is_sanitizer {
             for marker in ["Sanitizer: ", "libFuzzer: "] {
                 if let Some(i) = line.find(marker) {
                     let after = &line[i + marker.len()..];
@@ -19,8 +28,29 @@ pub fn stack_signature(output: &str) -> String {
                         .collect();
                     if !k.is_empty() {
                         kind = k;
+                        kind_is_sanitizer = true;
                     }
                     break;
+                }
+            }
+            if kind.is_empty() {
+                for (needle, tag) in [
+                    ("stack smashing detected", "stack-smashing"),
+                    ("double free or corruption", "double-free"),
+                    ("corrupted size vs. prev_size", "heap-corruption"),
+                    ("malloc(): ", "heap-corruption"),
+                    ("free(): ", "heap-corruption"),
+                    ("munmap_chunk(): invalid pointer", "invalid-free"),
+                    ("[signal: SIGSEGV]", "signal-SIGSEGV"),
+                    ("[signal: SIGABRT]", "signal-SIGABRT"),
+                    ("[signal: SIGBUS]", "signal-SIGBUS"),
+                    ("[signal: SIGFPE]", "signal-SIGFPE"),
+                    ("[signal: SIGILL]", "signal-SIGILL"),
+                ] {
+                    if line.contains(needle) {
+                        kind = tag.to_string();
+                        break;
+                    }
                 }
             }
         }
@@ -123,5 +153,96 @@ mod tests {
 ";
         assert!(stack_hash(out).is_some());
         assert!(stack_signature(out).contains("LLVMFuzzerTestOneInput"));
+    }
+
+    #[test]
+    fn glibc_stack_smashing_deduplicates() {
+        let a = "*** stack smashing detected ***: terminated\n";
+        let b = "*** stack smashing detected ***: terminated\n";
+        assert_eq!(stack_hash(a), stack_hash(b));
+        assert_eq!(stack_signature(a), "stack-smashing");
+    }
+
+    #[test]
+    fn glibc_double_free() {
+        let out = "free(): double free detected in tcache 2\n";
+        assert!(stack_hash(out).is_some());
+        assert!(stack_signature(out).starts_with("double-free")
+            || stack_signature(out).starts_with("heap-corruption"));
+    }
+
+    #[test]
+    fn glibc_heap_corruption() {
+        let out = "corrupted size vs. prev_size while consolidating\n";
+        assert_eq!(stack_signature(out), "heap-corruption");
+    }
+
+    #[test]
+    fn glibc_malloc_error() {
+        let out = "malloc(): unaligned tcache chunk detected\n";
+        assert_eq!(stack_signature(out), "heap-corruption");
+    }
+
+    #[test]
+    fn glibc_free_error() {
+        let out = "free(): invalid pointer\n";
+        assert_eq!(stack_signature(out), "heap-corruption");
+    }
+
+    #[test]
+    fn glibc_munmap_invalid() {
+        let out = "munmap_chunk(): invalid pointer\n";
+        assert_eq!(stack_signature(out), "invalid-free");
+    }
+
+    #[test]
+    fn signal_tag_deduplicates_traceless_crashes() {
+        let a = "[signal: SIGSEGV]";
+        let b = "[signal: SIGSEGV]";
+        assert_eq!(stack_hash(a), stack_hash(b));
+        assert_eq!(stack_signature(a), "signal-SIGSEGV");
+    }
+
+    #[test]
+    fn different_signals_are_different_bugs() {
+        let segv = "[signal: SIGSEGV]";
+        let bus = "[signal: SIGBUS]";
+        assert_ne!(stack_hash(segv), stack_hash(bus));
+    }
+
+    #[test]
+    fn signal_after_output_still_uses_higher_priority_kind() {
+        // if ASAN fires and the process also gets a signal, ASAN wins
+        let out = "\
+==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1
+    #0 0x1 in copy_bytes /src/buf.c:12
+[signal: SIGSEGV]";
+        assert!(stack_signature(out).starts_with("heap-buffer-overflow"));
+    }
+
+    #[test]
+    fn glibc_before_asan_prefers_asan() {
+        // glibc prints "stack smashing detected" before ASAN's handler
+        // fires; the signature should use ASAN's more specific class
+        let out = "\
+*** stack smashing detected ***: terminated
+==1==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x1
+    #0 0x1 in handle_type_3 /src/vuln_parser.c:55
+    #1 0x2 in main /src/vuln_parser.c:90
+";
+        let sig = stack_signature(out);
+        assert!(sig.starts_with("stack-buffer-overflow"), "got: {sig}");
+        assert!(sig.contains("handle_type_3"));
+    }
+
+    #[test]
+    fn stack_smashing_different_from_heap_overflow() {
+        let smash = "*** stack smashing detected ***: terminated\n";
+        let heap = "\
+==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1
+    #0 0x1 in copy_bytes /src/buf.c:12
+    #1 0x2 in handle /src/main.c:40
+";
+        assert_ne!(stack_hash(smash), stack_hash(heap));
     }
 }

@@ -1008,26 +1008,97 @@ fn drain_burst(
     events
 }
 
+const TRIAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // Re-run a crashing input under the triage command and capture its combined
 // output (sanitizers print to stderr). {file} is replaced with the input path.
+// Kills the child after TRIAGE_TIMEOUT so a hanging input can't block the
+// crash-report pipeline.
 fn run_triage(cmd: &[String], file: &str) -> String {
     let Some((program, args)) = cmd.split_first() else {
         return String::new();
     };
     let args: Vec<String> = args.iter().map(|a| a.replace("{file}", file)).collect();
-    match std::process::Command::new(program).args(&args).output() {
-        Ok(out) => {
-            let mut s = String::from_utf8_lossy(&out.stderr).into_owned();
-            if s.is_empty() {
-                s = String::from_utf8_lossy(&out.stdout).into_owned();
-            }
-            s
-        }
+
+    // Spawn the child with piped stdio, then drain stderr/stdout on
+    // dedicated threads so large ASAN traces don't fill the pipe buffer
+    // and deadlock. The main thread polls try_wait with a timeout.
+    let mut child = match std::process::Command::new(program)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, %program, "triage command failed to run");
-            String::new()
+            return String::new();
+        }
+    };
+
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let t_err = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut buf);
+        buf
+    });
+    let t_out = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout_pipe, &mut buf);
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + TRIAGE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(%program, %file, "triage timed out, killing child");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return "[triage timeout]".to_string();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %program, "triage wait failed");
+                let _ = child.kill();
+                let _ = child.wait();
+                return String::new();
+            }
+        }
+    };
+
+    let stderr = t_err.join().unwrap_or_default();
+    let stdout = t_out.join().unwrap_or_default();
+
+    let mut s = String::from_utf8_lossy(&stderr).into_owned();
+    if s.is_empty() {
+        s = String::from_utf8_lossy(&stdout).into_owned();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = match sig {
+                libc::SIGSEGV => "SIGSEGV",
+                libc::SIGABRT => "SIGABRT",
+                libc::SIGBUS => "SIGBUS",
+                libc::SIGFPE => "SIGFPE",
+                libc::SIGILL => "SIGILL",
+                _ => "",
+            };
+            if !name.is_empty() {
+                if !s.is_empty() && !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s.push_str(&format!("[signal: {}]", name));
+            }
         }
     }
+    s
 }
 
 async fn pull_and_inject(

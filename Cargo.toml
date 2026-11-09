@@ -34,3 +34,4 @@ uuid = { version = "1.11", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 hex = "0.4"
+libc = "0.2"
