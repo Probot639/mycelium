@@ -1,6 +1,6 @@
 # CLI reference
 
-The binary is `mycelium`. It has five subcommands: `spawn` starts the coordinator, `inoculate` creates a campaign, `join` attaches a fuzzing node, `probe` shows status, and `sever` detaches a node.
+The binary is `mycelium`. It has six subcommands: `spawn` starts the coordinator, `inoculate` creates a campaign, `join` attaches a fuzzing node, `probe` shows status, `sever` detaches a node, and `ping` checks fleet connectivity.
 
 Wherever a command takes `--coordinator`, you can pass either a bare `host:port` (like `sigil:7100`) or a full `http://...` URL. A bare value gets `http://` prefixed for you.
 
@@ -120,8 +120,7 @@ Campaign: fuzz-libpng
 NODE             HOST         FUZZER       PRIORITY   STATUS       LAST SYNC
 sigil-a1f2       sigil        aflpp        dedicated  online       14:32:07
 songbird-b3e4    songbird     aflpp        shared     online       14:32:05
-glyph-c5d6       glyph        aflpp        idle       online       14:31:58
-tarot-d7e8       tarot        aflpp        shared     online       14:32:01
+glyph1-c5d6      glyph-1      aflpp        shared     online       14:31:58
 ```
 
 | Flag | Default | Description |
@@ -147,3 +146,23 @@ mycelium sever --coordinator sigil:7100 --node-id sigil-a1f2 --drain
 | `--drain` | off | Graceful detach: suspend the node and keep its corpus, crashes, and distribution history. Without it, the node and its history are removed outright. |
 
 The node ID is the `hostname-xxxx` value the coordinator assigned at join, not the hostname on its own.
+
+## ping
+
+TCP-ping fleet nodes until all respond. No coordinator needed. Useful for checking that SSH (or any port) is reachable across the fleet before starting a campaign.
+
+```
+mycelium ping sigil songbird glyph-1
+```
+
+Probes port 22 on each host, prints round-trip times, and loops until every node responds. To check a different port (for example, the coordinator):
+
+```
+mycelium ping sigil --port 7100
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `<nodes>...` | required | One or more hostnames or IPs to probe. |
+| `--port` | `22` | TCP port to connect to on each node. |
+| `--interval` | `3` | Seconds between retry rounds when nodes are unreachable. |
