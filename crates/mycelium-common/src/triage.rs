@@ -19,22 +19,32 @@ pub fn stack_signature(output: &str) -> String {
         // detected" then calls abort(); ASAN's signal handler fires after
         // that, so without this precedence the less-informative tag sticks.
         if !kind_is_sanitizer {
-            for marker in ["Sanitizer: ", "libFuzzer: "] {
-                if let Some(i) = line.find(marker) {
-                    let after = &line[i + marker.len()..];
-                    let k: String = after
-                        .chars()
-                        .take_while(|c| !matches!(c, ' ' | '(' | ':'))
-                        .collect();
-                    if !k.is_empty() {
-                        kind = k;
-                        kind_is_sanitizer = true;
+            // Check specific sanitizer prefixes before the generic
+            // "Sanitizer: " substring, so LeakSanitizer gets a real kind
+            // instead of the word after the colon ("detected").
+            if let Some(i) = line.find("LeakSanitizer: ") {
+                let _ = i;
+                kind = "memory-leak".to_string();
+                kind_is_sanitizer = true;
+            } else {
+                for marker in ["Sanitizer: ", "libFuzzer: "] {
+                    if let Some(i) = line.find(marker) {
+                        let after = &line[i + marker.len()..];
+                        let k: String = after
+                            .chars()
+                            .take_while(|c| !matches!(c, ' ' | '(' | ':'))
+                            .collect();
+                        if !k.is_empty() {
+                            kind = k;
+                            kind_is_sanitizer = true;
+                        }
+                        break;
                     }
-                    break;
                 }
             }
             if kind.is_empty() {
                 for (needle, tag) in [
+                    ("runtime error: ", "ubsan"),
                     ("stack smashing detected", "stack-smashing"),
                     ("double free or corruption", "double-free"),
                     ("corrupted size vs. prev_size", "heap-corruption"),
@@ -233,6 +243,50 @@ mod tests {
         let sig = stack_signature(out);
         assert!(sig.starts_with("stack-buffer-overflow"), "got: {sig}");
         assert!(sig.contains("handle_type_3"));
+    }
+
+    #[test]
+    fn ubsan_runtime_error_recognized() {
+        let out = "/src/math.c:42:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'\n";
+        assert_eq!(stack_signature(out), "ubsan");
+        assert!(stack_hash(out).is_some());
+    }
+
+    #[test]
+    fn ubsan_with_frames_includes_kind() {
+        let out = "\
+/src/math.c:42:5: runtime error: signed integer overflow
+    #0 0x4a2b3c in do_math /src/math.c:42:5
+    #1 0x4a2e40 in main /src/main.c:100
+";
+        let sig = stack_signature(out);
+        assert!(sig.starts_with("ubsan"), "got: {sig}");
+        assert!(sig.contains("do_math"));
+    }
+
+    #[test]
+    fn ubsan_overridden_by_asan() {
+        // UBSan fires first, then ASAN catches the resulting corruption
+        let out = "\
+/src/math.c:42:5: runtime error: signed integer overflow
+==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1
+    #0 0x1 in corrupt /src/buf.c:10
+";
+        let sig = stack_signature(out);
+        assert!(sig.starts_with("heap-buffer-overflow"), "got: {sig}");
+    }
+
+    #[test]
+    fn lsan_gets_real_kind() {
+        let out = "\
+==1234==ERROR: LeakSanitizer: detected memory leaks
+Direct leak of 128 byte(s) in 1 object(s) allocated from:
+    #0 0x1 in malloc
+    #1 0x2 in leaky_func /src/leak.c:10
+";
+        let sig = stack_signature(out);
+        assert!(sig.starts_with("memory-leak"), "got: {sig}");
+        assert!(sig.contains("leaky_func"));
     }
 
     #[test]
