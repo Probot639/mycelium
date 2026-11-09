@@ -21,3 +21,4 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }
+rand = { workspace = true }

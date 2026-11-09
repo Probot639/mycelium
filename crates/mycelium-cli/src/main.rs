@@ -113,6 +113,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Ping random nodes until all respond
+    Ping {
+        #[arg(long)]
+        coordinator: String,
+        /// Port to probe on each node (default: 22/ssh)
+        #[arg(long, default_value = "22")]
+        port: u16,
+        /// Seconds between rounds
+        #[arg(long, default_value = "3")]
+        interval: u64,
+    },
 }
 
 #[tokio::main]
@@ -574,6 +586,97 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+        }
+
+        Commands::Ping {
+            coordinator,
+            port,
+            interval,
+        } => {
+            let base = if coordinator.starts_with("http") {
+                coordinator
+            } else {
+                format!("http://{coordinator}")
+            };
+            let my_hostname = gethostname();
+
+            loop {
+                let resp: mycelium_common::protocol::ScryResponse =
+                    reqwest::get(format!("{base}/scry")).await?.json().await?;
+
+                let others: Vec<&mycelium_common::node::NodeInfo> = resp
+                    .nodes
+                    .iter()
+                    .filter(|n| n.hostname != my_hostname)
+                    .collect();
+
+                if others.is_empty() {
+                    println!("no other nodes registered, waiting...");
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    continue;
+                }
+
+                // pick up to 2 random nodes
+                use rand::seq::SliceRandom;
+                let mut rng = rand::rng();
+                let mut sample = others.clone();
+                sample.shuffle(&mut rng);
+                let targets: Vec<_> = sample.into_iter().take(2).collect();
+
+                for node in &targets {
+                    let addr = format!("{}:{}", node.hostname, port);
+                    let start = std::time::Instant::now();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tokio::net::TcpStream::connect(&addr),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            let ms = start.elapsed().as_millis();
+                            println!("{} ({}) :: {}ms", node.hostname, node.id, ms);
+                        }
+                        Ok(Err(e)) => {
+                            println!("{} ({}) :: FAIL {}", node.hostname, node.id, e);
+                        }
+                        Err(_) => {
+                            println!("{} ({}) :: TIMEOUT", node.hostname, node.id);
+                        }
+                    }
+                }
+
+                // now check all nodes, not just the sample
+                let mut unreachable: Vec<String> = Vec::new();
+                for node in &others {
+                    let addr = format!("{}:{}", node.hostname, port);
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tokio::net::TcpStream::connect(&addr),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        _ => unreachable.push(node.hostname.clone()),
+                    }
+                }
+
+                if unreachable.is_empty() {
+                    println!(
+                        "all {} nodes reachable",
+                        others.len()
+                    );
+                    break;
+                }
+
+                println!(
+                    "{}/{} unreachable: {}  retrying in {}s...",
+                    unreachable.len(),
+                    others.len(),
+                    unreachable.join(", "),
+                    interval
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             }
         }
     }
