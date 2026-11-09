@@ -37,10 +37,13 @@ mycelium inoculate --coordinator sigil:7100 \
   --campaign fuzz-libpng \
   --harness ./fuzz_png \
   --fuzzer aflpp \
+  --triage-cmd './fuzz_png_asan {file}' \
   -- afl-fuzz -i {corpus} -o {output} -M main -F {inject} -- {harness}
 ```
 
 `{harness}`, `{corpus}`, `{output}`, and `{inject}` are placeholders. Each node fills them in with local paths. For AFL++ the command must run a main instance (`-M main`) and import the injected foreign corpus (`-F {inject}`), so that seeds pulled from peers reach the running fuzzer. Without `-F {inject}` a node still fuzzes, but it only works from its own inputs.
+
+`--triage-cmd` tells nodes how to re-run a crashing input to capture a sanitizer trace for dedup. Point it at an ASAN build of the target. Without it, each distinct crashing input is its own "bug."
 
 On each fuzzing node, join the campaign. The node downloads the harness, creates working directories, and starts the fuzzer:
 
@@ -97,7 +100,7 @@ Campaigns are created with `inoculate`, which uploads the harness binary and fuz
 
 Each node runs a filesystem watcher (inotify) on the fuzzer's corpus and crash directories. When AFL++ writes a new queue entry, the node hashes it and pushes it to the coordinator. On a timer (default 30s), the node pulls seeds it hasn't seen from the coordinator and drops them into the fuzzer's input directory.
 
-Corpus dedup is content-addressed (SHA-256). Crash dedup is by stack hash (first 3 lines of sanitizer output). The coordinator tracks which seeds each node has already received so it doesn't re-send them.
+Corpus dedup is content-addressed (SHA-256). Crash dedup is by stack hash: the node re-runs each crashing input under a triage command, extracts the error class and top stack frames from the output, and hashes that signature. Inputs that hit the same bug share a hash. The signature extractor handles ASAN, libFuzzer, glibc runtime errors (stack smashing, double free, heap corruption), and bare signal deaths, so QEMU-mode fuzzing without ASAN still gets useful dedup. The coordinator tracks which seeds each node has already received so it doesn't re-send them.
 
 The coordinator is a single process with a SQLite database. No external dependencies, no message queue, no consensus protocol. HTTP over whatever network you have. Designed for a tailnet but works anywhere the nodes can reach port 7100.
 
@@ -105,12 +108,14 @@ The coordinator is a single process with a SQLite database. No external dependen
 
 ```
 crates/
-  mycelium-common/       shared types, corpus hashing, stats parsing
+  mycelium-common/       shared types, corpus hashing, triage/dedup, stats parsing
   mycelium-coordinator/  HTTP coordinator, SQLite storage
   mycelium-node/         filesystem watcher, sync client, config
   mycelium-cli/          binary, subcommands
 deploy/
   k3s/                   PoC kubernetes manifests (untested)
+  helm/                  Helm chart for coordinator + fuzzer fleet
+test-cluster/            Vagrant 3-VM local test cluster (vagrant-libvirt)
 ```
 
 ## Config reference

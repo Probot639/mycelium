@@ -14,6 +14,7 @@ Shared types used by both sides of the wire. If a struct crosses the network, it
 
 - `protocol.rs` holds the request and response types for every endpoint. These derive `Serialize` and `Deserialize`, so the JSON shapes in [http-api.md](http-api.md) come straight from these definitions.
 - `corpus.rs` holds `Seed` and `CrashEntry`, plus `hash_bytes`, the SHA-256 helper that gives every seed its content address.
+- `triage.rs` holds `stack_signature` and `stack_hash`, the crash dedup functions. `stack_signature` reduces triage output to a stable per-bug signature: the error class plus the top 6 stack frames, with volatile addresses and offsets dropped. It recognizes ASAN markers, libFuzzer markers, glibc runtime diagnostics (stack smashing, double free, heap corruption, invalid free), and synthetic signal tags (`[signal: SIGSEGV]` etc.) appended by the node when the triage subprocess is killed by a signal. ASAN/libFuzzer markers take precedence over glibc/signal tags regardless of line order.
 - `node.rs` holds `NodeInfo`, the `Priority` enum (`dedicated`, `shared`, `idle`), and the `NodeStatus` enum (`online`, `unreachable`, `offline`, `suspended`). Both enums serialize as lowercase strings.
 - `stats.rs` parses a fuzzer's stats file into a `FuzzerStats` struct (execs per second, total execs, corpus size, crashes, hangs, edges).
 
@@ -50,7 +51,7 @@ Once the fuzzer is running, the node resolves the directories it actually writes
 
 After that the node runs a select loop over three things:
 
-- A watcher event. A new queue entry becomes a seed push. A new crash file becomes a crash report.
+- A watcher event. A new queue entry becomes a seed push. A new crash file triggers the triage pipeline: the node re-runs the input under the triage command (with a 30-second timeout to prevent hangs), extracts a stack signature from the output, hashes it, and reports the crash to the coordinator. Up to 8 triage tasks run concurrently, capped by a semaphore.
 - A timer tick. On each tick the node pulls any seeds it has not seen yet and drops them into the inject directory (the AFL++ `-F` foreign-corpus dir), so the running fuzzer imports them without a restart. The node also reads the fuzzer's stats file, parses it, and sends a heartbeat with the current execs per second, corpus size, and crash count.
 - The fuzzer process exiting. What happens next depends on the mode (see below).
 
@@ -92,7 +93,7 @@ The shared corpus. The primary key is `hash`, the SHA-256 of the seed contents, 
 
 ### crashes
 
-The crash set. The primary key is `input_hash`, the SHA-256 of the crashing input, so one input is stored once. Columns: `stack_hash`, `input_hash`, `data`, `sanitizer_output`, `source_node`, `campaign`, and `found_at`. The `stack_hash` is the dedup-by-bug key from the sanitizer output and is stored alongside the input, not used as the primary key.
+The crash set. The primary key is `(input_hash, campaign)`, the SHA-256 of the crashing input scoped to a campaign, so one input is stored once per campaign. Columns: `stack_hash`, `input_hash`, `data`, `sanitizer_output`, `source_node`, `campaign`, and `found_at`. The `stack_hash` groups crashes by bug: it is derived from `stack_signature` in `triage.rs`, which extracts the error class and top stack frames from the triage output. When no triage command is configured, or when the triage output contains nothing recognizable, the node falls back to using `input_hash` as the `stack_hash`, so every distinct input becomes its own "bug." `COUNT(DISTINCT stack_hash)` is the "unique bugs" number shown by `probe`.
 
 ### seed_distribution
 
@@ -107,7 +108,7 @@ One row per campaign, created by `inoculate`. The primary key is `name`. Columns
 Alongside SQLite, the coordinator keeps raw bytes under the `--corpus` directory, created on startup:
 
 - `blobs/<hash>` is the raw bytes of each seed, written when the seed is first ingested.
-- `crashes/<stack_hash>/input.bin` and `crashes/<stack_hash>/trace.txt` hold the crashing input and the sanitizer output for each new crash.
+- `crashes/<stack_hash>/<input_hash>.bin` and `crashes/<stack_hash>/<input_hash>.txt` hold the crashing input and the triage output for each crash, grouped by bug. Multiple inputs that trigger the same bug live under the same `stack_hash` directory.
 - `harnesses/<campaign>` is the uploaded harness binary for a campaign, stored executable.
 
 The node also keeps local directories, either the `seeds`, `inject`, and `output` dirs it creates under `--workdir` in distributed mode, or the directories named in the config file in manual mode.

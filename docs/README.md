@@ -10,7 +10,7 @@ If you just want to get a campaign running, the top-level [README](../README.md)
 - [cli.md](cli.md) documents every subcommand and flag, with examples. The verbs are `spawn`, `inoculate`, `join`, `probe`, and `sever`.
 - [configuration.md](configuration.md) is the full `node.toml` reference for manual mode, including the `mode`, `stats_parser`, and `priority` settings, with a complete annotated example.
 - [http-api.md](http-api.md) describes every coordinator endpoint with its method, path, and request and response JSON. Read this if you are building a frontend or an automation client. The read endpoint everything consumes is `GET /scry`.
-- [deployment.md](deployment.md) covers the Docker image, Kubernetes via the `deploy/` tree, and the Vagrant test setup.
+- [deployment.md](deployment.md) covers the Docker image, Kubernetes via the `deploy/` tree, and the Vagrant test cluster in `test-cluster/`.
 - [coverage-agent.md](coverage-agent.md) is the framework for a plug-and-play coverage-management agent: the node coverage reader, the coordinator coverage API, and the tool-call surface an agent drives.
 
 ## A note on vocabulary

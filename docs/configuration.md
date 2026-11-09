@@ -114,6 +114,16 @@ Two things to keep straight. The `-M main` instance makes AFL++ write under `/wo
 
 Without `triage_cmd` a crash is reported with no trace, so the coordinator can only dedup by input: every distinct crashing input is its own entry. With `triage_cmd` set, the node re-runs each crashing input to capture a sanitizer trace, reduces it to a signature (the error class plus the top stack frames, with addresses dropped), and hashes that. Inputs that hit the same bug share a stack hash, so the coordinator groups them.
 
+The triage subprocess runs with a 30-second timeout. If the input causes a hang (infinite loop, deadlock), the child is killed and the crash is reported with `[triage timeout]` as the output, which falls back to per-input dedup for that crash. Up to 8 triage tasks run concurrently per node.
+
+The signature extractor recognizes several output formats:
+
+- **ASAN and libFuzzer markers** (e.g. `AddressSanitizer: heap-buffer-overflow`). These carry the most specific error class and always take priority.
+- **glibc runtime diagnostics** (`stack smashing detected`, `double free or corruption`, `corrupted size vs. prev_size`, `malloc()` and `free()` errors, `munmap_chunk(): invalid pointer`). Common in QEMU-mode fuzzing without ASAN.
+- **Signal tags** (`[signal: SIGSEGV]`, `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL`). Appended by the node when the triage subprocess is killed by a signal and produces no other diagnostic output.
+
+When both a glibc message and an ASAN marker appear in the same output (glibc prints first, then ASAN's signal handler fires), the ASAN marker wins.
+
 On disk the coordinator keeps `crashes/<stack_hash>/<input_hash>.bin` and a matching `.txt` trace, so every reproducer of a bug survives under that bug's directory. `probe` and the dashboard show both numbers: `crashes` is the count of distinct inputs, and `bugs` is the count of distinct stack hashes. A healthy triaged campaign shows far fewer bugs than crashes.
 
 For an AFL++ node, point `triage_cmd` at an ASAN-instrumented standalone build of the target that takes the input as a file argument. For a libFuzzer node, the fuzzer binary itself reproduces a single input and prints the trace, so `triage_cmd = ["./harness", "{file}"]`.

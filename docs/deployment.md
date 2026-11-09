@@ -20,6 +20,12 @@ The `deploy/k3s/` directory has three manifests. They are written against k3s bu
 
 These are a starting point, not a turnkey install. They carry `TODO` markers for things like the real image registry path, and they have not been run end to end.
 
+## Vagrant test cluster
+
+The `test-cluster/` directory has a Vagrantfile and provision scripts for a 3-VM local cluster (1 coordinator + 2 fuzzing nodes) on vagrant-libvirt. The VMs use `generic/arch` boxes on a 10.10.10.0/24 private network (separate from the 192.168.121.0/24 management network). The coordinator provisions a campaign with AFL++ in QEMU mode against a test harness; start the node services after provisioning to begin fuzzing.
+
+The provision scripts build two copies of the test harness: one without ASAN for QEMU-mode fuzzing (ASAN's shadow memory exceeds node RAM under QEMU emulation) and one with ASAN for crash triage only.
+
 ## What is still landing
 
-The `deploy/` tree is being built out beyond the k3s manifests. Planned additions are a Helm chart and per-distro notes for kind, k3d, minikube, microk8s, k3s, and vanilla kubeadm, plus a Vagrant multi-node setup for local testing. These may not be present yet. When you pull the repo, check `deploy/` for a chart directory or a `Vagrantfile` and follow what is actually there. If this doc and the directory disagree, the directory is right.
+The `deploy/` tree is being built out beyond the k3s manifests. A Helm chart and per-distro notes for kind, k3d, minikube, microk8s, k3s, and vanilla kubeadm are planned additions. When you pull the repo, check `deploy/` for a chart directory and follow what is actually there. If this doc and the directory disagree, the directory is right.

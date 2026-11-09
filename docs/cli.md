@@ -39,6 +39,7 @@ mycelium inoculate --coordinator sigil:7100 \
 | `--harness` | required | Path to the harness binary to upload and distribute. |
 | `--fuzzer` | `aflpp` | Fuzzer identifier stored with the campaign and shown in status. Also selects the fuzzer profile. |
 | `--seeds` | none | Directory of starting seeds, uploaded as the campaign's base corpus so joining nodes begin from real inputs instead of an empty corpus. |
+| `--triage-cmd` | none | Command to re-run a crashing input for dedup. `{file}` is replaced with the crash path. Point it at an ASAN build of the target. Without it, crashes are deduped per input, not per bug. See [configuration.md](configuration.md#crash-triage-and-dedup). |
 | `-- <cmd>...` | required | The fuzzer command template, everything after `--`. |
 
 ### The command template
